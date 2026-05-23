@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/pi-core", "crates/pi-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Joel Odom"]
+repository = ""
+
+[workspace.dependencies]
+pi-core = { path = "crates/pi-core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
+rug = { version = "1.24", default-features = false, features = ["integer", "float"] }
+
+# Release profile tuned for the long-running compute path.  LTO is worth a
+# few percent on GMP-heavy workloads, and a single codegen unit lets the
+# inliner pull the small per-term helpers into the binary-split hot loop.
+[profile.release]
+lto = "thin"
+codegen-units = 1

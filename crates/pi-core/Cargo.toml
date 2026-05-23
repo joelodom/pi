@@ -1,0 +1,11 @@
+[package]
+name = "pi-core"
+description = "Core library for computing pi to arbitrary precision."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rug.workspace = true

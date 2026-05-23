@@ -1,0 +1,17 @@
+[package]
+name = "pi-cli"
+description = "Command-line interface for computing pi."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pi"
+path = "src/main.rs"
+
+[dependencies]
+pi-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+indicatif.workspace = true
