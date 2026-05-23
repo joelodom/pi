@@ -31,7 +31,7 @@
 //! cannot survive a byte-by-byte agreement on D digits with the other.
 
 use anyhow::Result;
-use rug::{Float, Integer};
+use rug::{Assign, Float, Integer};
 
 use crate::output::DigitSink;
 use crate::precision::PrecisionPlan;
@@ -86,54 +86,77 @@ impl PiAlgorithm for GaussLegendre {
             Phase { name: PHASE_DECIMAL_CONVERSION, total: 1 },
         ]);
 
-        // --- Initialization ---------------------------------------------------
-        progress.start_phase(PHASE_INIT, 1);
-        let mut a = Float::with_val_64(prec, 1);
-        // b = 1/√2 = √(1/2).  One sqrt is cheaper than sqrt then reciprocal.
-        let mut b = Float::with_val_64(prec, 0.5_f64);
-        b.sqrt_mut();
-        let mut t = Float::with_val_64(prec, 0.25_f64);
-        let mut p = Integer::from(1);
-        progress.tick();
-        progress.end_phase();
-
-        // --- AGM iterations ---------------------------------------------------
-        progress.start_phase(PHASE_ITERATIONS, n_iterations as u64);
-        for _ in 0..n_iterations {
-            // a_new = (a + b) / 2
-            let mut a_new = Float::with_val_64(prec, &a + &b);
-            a_new /= 2_u32;
-
-            // b_new = √(a · b)
-            let mut b_new = Float::with_val_64(prec, &a * &b);
-            b_new.sqrt_mut();
-
-            // t -= p · (a − a_new)²
-            let diff = Float::with_val_64(prec, &a - &a_new);
-            let mut diff_sq = Float::with_val_64(prec, &diff * &diff);
-            diff_sq *= &p;
-            t -= &diff_sq;
-
-            a = a_new;
-            b = b_new;
-            p <<= 1_u32;
-
+        // Run initialization, iterations, and final assembly inside a
+        // scope so `a`, `b`, `t`, `p`, and the per-iteration scratch
+        // Floats all get dropped before the decimal-conversion phase
+        // allocates its own large buffers.  At billion-plus digits each
+        // Float is multi-GB, so this scope plus the pre-allocated
+        // scratch (avoiding 4 fresh Float allocations per iteration)
+        // are what let the working set stay below the binary-splitting
+        // peak instead of stacking on top of it.
+        let pi = {
+            // --- Initialization -------------------------------------------
+            progress.start_phase(PHASE_INIT, 1);
+            let mut a = Float::with_val_64(prec, 1);
+            // b = 1/√2 = √(1/2).  One sqrt is cheaper than sqrt then reciprocal.
+            let mut b = Float::with_val_64(prec, 0.5_f64);
+            b.sqrt_mut();
+            let mut t = Float::with_val_64(prec, 0.25_f64);
+            let mut p = Integer::from(1);
+            // Pre-allocated scratch Floats reused every iteration.  Avoid
+            // 4 full-precision Float allocations per iteration (~16 GB of
+            // alloc churn at 10B digits over ~32 iterations).
+            let mut a_new = Float::with_val_64(prec, 0);
+            let mut b_new = Float::with_val_64(prec, 0);
+            let mut diff = Float::with_val_64(prec, 0);
+            let mut diff_sq = Float::with_val_64(prec, 0);
             progress.tick();
-        }
-        progress.end_phase();
+            progress.end_phase();
 
-        // --- Final assembly: π = (a + b)² / (4 · t) ---------------------------
-        progress.start_phase(PHASE_FINAL_ASSEMBLY, 1);
-        let mut pi = Float::with_val_64(prec, &a + &b);
-        pi.square_mut();
-        pi /= &t;
-        pi /= 4_u32;
-        progress.tick();
-        progress.end_phase();
+            // --- AGM iterations -------------------------------------------
+            progress.start_phase(PHASE_ITERATIONS, n_iterations as u64);
+            for _ in 0..n_iterations {
+                // a_new = (a + b) / 2
+                a_new.assign(&a + &b);
+                a_new /= 2_u32;
 
-        // --- Decimal conversion ----------------------------------------------
+                // b_new = √(a · b)
+                b_new.assign(&a * &b);
+                b_new.sqrt_mut();
+
+                // t -= p · (a − a_new)²
+                diff.assign(&a - &a_new);
+                diff_sq.assign(&diff * &diff);
+                diff_sq *= &p;
+                t -= &diff_sq;
+
+                // Promote a_new → a (and similarly b_new → b) by
+                // swapping — the previous `a` (now in `a_new`) gets
+                // overwritten by the next iteration's `assign`, so no
+                // copy is needed.
+                std::mem::swap(&mut a, &mut a_new);
+                std::mem::swap(&mut b, &mut b_new);
+                p <<= 1_u32;
+
+                progress.tick();
+            }
+            progress.end_phase();
+
+            // --- Final assembly: π = (a + b)² / (4 · t) -------------------
+            progress.start_phase(PHASE_FINAL_ASSEMBLY, 1);
+            let mut pi = Float::with_val_64(prec, &a + &b);
+            pi.square_mut();
+            pi /= &t;
+            pi /= 4_u32;
+            progress.tick();
+            progress.end_phase();
+            pi
+            // a, b, t, p, a_new, b_new, diff, diff_sq all dropped here.
+        };
+
+        // --- Decimal conversion --------------------------------------------
         progress.start_phase(PHASE_DECIMAL_CONVERSION, 1);
-        write_decimal_digits(&pi, digits, sink)?;
+        write_decimal_digits(pi, digits, sink)?;
         progress.tick();
         progress.end_phase();
 

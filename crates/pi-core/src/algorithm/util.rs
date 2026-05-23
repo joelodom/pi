@@ -52,33 +52,45 @@ pub(super) fn widen_mpfr_exponent_range_for(digits: u64) -> Result<()> {
 /// Render `pi` to exactly `digits` decimal digits (counting the leading
 /// `3`) and stream them through `sink`.
 ///
+/// Takes `pi` **by value** and operates on it in place so that the
+/// scale Float, the scaled Float, and `pi` itself are not all in memory
+/// at once.  At a billion-plus digits each of those is multi-gigabyte;
+/// the explicit `drop`s along the way claw back ~2 full-precision
+/// Floats compared to the obvious "create a new scaled value" version.
+///
 /// `pi` must already hold the value of π to enough working precision
 /// (see [`crate::precision::PrecisionPlan`]) that all `digits` decimal
 /// digits are correct.
 pub(super) fn write_decimal_digits(
-    pi: &Float,
+    mut pi: Float,
     digits: u64,
     sink: &mut dyn DigitSink,
 ) -> Result<()> {
-    // Multiply by 10^(digits - 1) so the truncated value is an integer
-    // with exactly `digits` decimal digits.  The working precision is
-    // wide enough to represent 10^(digits - 1) exactly, so the
-    // multiplication is lossless to many more bits than we need.
+    // Build the scale 10^(digits - 1) at the same working precision.
     let prec = pi.prec_64();
-    let exp = Integer::from(digits) - 1_u32;
     let mut scale = Float::with_val_64(prec, 10);
+    let exp = Integer::from(digits) - 1_u32;
     scale.pow_assign(&exp);
-    let scaled = Float::with_val_64(prec, pi * &scale);
+    drop(exp);
+
+    // Scale `pi` in place — `pi *= &scale` reuses pi's mantissa
+    // allocation, then we immediately drop `scale` (full-precision
+    // Float, multi-GB at scale).
+    pi *= &scale;
+    drop(scale);
 
     // Truncate (round toward -∞ — for positive pi the same as floor and
     // the same as `trunc`).  Float::to_integer rounds to nearest, which
     // would give the wrong answer for "the first N digits of pi"
     // whenever the digit just past the cut is ≥ 5.
-    let (int_part, _ord) = scaled
+    let (int_part, _ord) = pi
         .to_integer_round(Round::Down)
         .ok_or_else(|| anyhow!("pi scaled to integer was non-finite"))?;
+    drop(pi);
 
     let mut s = int_part.to_string();
+    drop(int_part);
+
     let want = digits as usize;
     match s.len().cmp(&want) {
         std::cmp::Ordering::Less => {
