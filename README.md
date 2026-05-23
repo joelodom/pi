@@ -66,12 +66,16 @@ Run `./target/release/pi --help` for the full flag list.
 * **Verify-hex (BBP spot-check)** — `pi --verify-hex HEX_FILE
   [--from-decimal DEC_FILE]`.  If `HEX_FILE` exists, reuses it; otherwise
   `--from-decimal` is required and converts the decimal pi file to hex
-  on disk (atomic `.tmp` + rename).  Then BBP-spot-checks the hex file
-  in two phases: a deterministic sanity sweep over the first / middle /
-  last 1M hex digits, followed by an unbounded random-sampling loop
-  (window starts via `OsRng`, 8 hex digits per BBP call, parallel via
-  rayon).  Runs until SIGINT or a mismatch; on mismatch reports the
-  position and the offending byte and exits non-zero.
+  on disk (atomic `.tmp` + rename).  BBP-spot-checks the hex file in
+  **four parallel phases**, each with its own progress bar: the three
+  sanity regions (first / middle / last 1M hex digits, deterministic)
+  and an unbounded random-sampling loop (window starts via `OsRng`, 8
+  hex digits per BBP call).  All four share a rayon thread pool; as
+  sanity phases finish, their CPU naturally redistributes to remaining
+  phases via work-stealing.  Runs until SIGINT or a mismatch; SIGINT
+  exits within milliseconds (BBP polls a stop flag every ~10K inner
+  iterations) and on mismatch reports the position and the offending
+  byte, exits non-zero.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -84,7 +88,7 @@ Run `./target/release/pi --help` for the full flag list.
 | `--from-decimal DEC_FILE` | | With `--verify-hex`, source decimal file to convert when `HEX_FILE` doesn't yet exist. |
 | `--samples-per-window M` | `100` | With `--verify-hex`, BBP samples per random-window (each call covers 8 hex digits). |
 | `--sanity-samples N` | `100` | With `--verify-hex`, BBP samples per sanity region (first/middle/last 1M). |
-| `--jobs J` | ncpu | With `--verify-hex`, rayon worker threads. |
+| `--max-jobs J` | ncpu | With `--verify-hex`, maximum rayon worker threads (shared across all parallel verification phases). |
 
 Running `pi` with no arguments prints the help text.
 

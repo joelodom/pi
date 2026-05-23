@@ -1,23 +1,28 @@
 //! `--verify-hex` mode: convert a decimal pi file to hex (one-time,
-//! cached on disk), then BBP-spot-check the hex file at deterministic
-//! sanity positions followed by an open-ended cryptographically-random
-//! sampling loop.
+//! cached on disk), then BBP-spot-check the hex file.
 //!
-//! Progress is rendered as a stack of multi-progress bars (one per
-//! phase), declared up front so pending phases are visible alongside
-//! the running and completed ones — matching the look of the compute
-//! pipeline.  The conversion sub-phases and the unbounded random loop
-//! are shown as spinners; the bounded sanity regions are shown as
-//! finite bars that tick once per BBP call.
+//! After conversion (if needed), the three sanity regions (first /
+//! middle / last 1M) and the unbounded random-sampling loop all run
+//! **concurrently** on a shared rayon pool.  Each phase has its own
+//! progress bar so the user sees all four in flight side-by-side.  As
+//! sanity phases finish, their CPU naturally redistributes to the
+//! remaining phases through rayon's work-stealing.
 //!
-//! See `--verify-hex` notes in the top-level README.
+//! Coordination across phases is a single `AtomicBool` "stop" flag.
+//! It is set by the SIGINT handler (clean shutdown, exit 0) or by any
+//! phase that detects a mismatch (error captured into a shared slot,
+//! exit 1).  The flag is threaded all the way into
+//! `bbp::hex_digits_at_interruptible` so an in-flight BBP call at deep
+//! n bails within a few milliseconds rather than the ~minutes one call
+//! would otherwise take.
 
 use std::fs;
 use std::fs::File;
 use std::io::Write;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -40,7 +45,7 @@ pub fn run(
     from_decimal: Option<&Path>,
     samples_per_window: usize,
     sanity_samples: usize,
-    jobs: Option<usize>,
+    max_jobs: Option<usize>,
 ) -> Result<()> {
     // ---------------------------------------------------------------------
     // Pre-flight: figure out whether to convert.
@@ -74,9 +79,11 @@ pub fn run(
     let random = PhaseBar::new_spinner(&multi, "random sampling");
 
     // ---------------------------------------------------------------------
-    // Rayon pool sized per `--jobs`.
+    // Rayon pool sized per `--max-jobs`.  All four verification phases
+    // share this pool; rayon work-stealing redistributes workers as
+    // sanity phases finish.
     // ---------------------------------------------------------------------
-    let pool = match jobs {
+    let pool = match max_jobs {
         Some(j) => rayon::ThreadPoolBuilder::new()
             .num_threads(j)
             .build()
@@ -87,28 +94,28 @@ pub fn run(
     };
 
     // ---------------------------------------------------------------------
-    // SIGINT handling.  The handler flips an AtomicBool; the random loop
-    // and parallel-iter closures check it between BBP calls.
+    // Coordination: a single `stop` flag (set by SIGINT or by a mismatch),
+    // and a single slot for the first error.  Both phases and BBP itself
+    // poll `stop`.
     // ---------------------------------------------------------------------
-    let interrupted = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let first_error: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
+
     {
-        let i = Arc::clone(&interrupted);
-        // `set_handler` is per-process; the binary only ever calls it once.
+        let s = Arc::clone(&stop);
         let _ = ctrlc::set_handler(move || {
-            i.store(true, Ordering::SeqCst);
+            s.store(true, Ordering::SeqCst);
         });
     }
 
     // ---------------------------------------------------------------------
-    // Convert if needed.
+    // Convert if needed.  (Conversion stays sequential — each step
+    // depends on the previous.)
     // ---------------------------------------------------------------------
     if let (false, Some(dec)) = (hex_exists, from_decimal) {
         let conv = conv.as_ref().expect("conversion bars present when converting");
         convert_decimal_to_hex(dec, hex_path, conv)?;
     } else {
-        // `multi.suspend` runs the closure with bars paused (so the
-        // message lands above them in tty mode), and is a plain no-op
-        // wrapper around the closure in non-tty mode.
         multi.suspend(|| {
             eprintln!("reusing existing hex file: {}", hex_path.display());
         });
@@ -122,7 +129,7 @@ pub fn run(
     let (data_offset, n_hex_digits) = scan_hex_file(&file)?;
     multi.suspend(|| {
         eprintln!(
-            "hex file: {} ({} hex digits past \"3.\"), {} rayon thread(s)",
+            "hex file: {} ({} hex digits past \"3.\"), max-jobs {}",
             hex_path.display(),
             fmt_thousands(n_hex_digits),
             pool.current_num_threads()
@@ -130,36 +137,81 @@ pub fn run(
     });
 
     // ---------------------------------------------------------------------
-    // Sanity sweep (bounded, fails fast on mismatch).
+    // Build the three sanity ranges and launch all four phases in
+    // parallel via `pool.scope`.
     // ---------------------------------------------------------------------
-    let sanity_completed = pool.install(|| {
-        run_sanity_phase(
-            &file,
-            data_offset,
-            n_hex_digits,
-            sanity_samples,
-            &sanity,
-            &interrupted,
-        )
-    })?;
-    if !sanity_completed {
-        multi.suspend(|| eprintln!("interrupted during sanity phase."));
-        return Ok(());
-    }
+    let range_first = 0..1_000_000_u64.min(n_hex_digits);
+    let half = n_hex_digits / 2;
+    let range_middle = half..(half + 1_000_000).min(n_hex_digits);
+    let range_last = n_hex_digits.saturating_sub(1_000_000)..n_hex_digits;
+
+    let file_ref = &file;
+    let stop_ref: &AtomicBool = &stop;
+    let error_slot_ref: &Mutex<Option<anyhow::Error>> = &first_error;
+    let first_bar = &sanity.first;
+    let middle_bar = &sanity.middle;
+    let last_bar = &sanity.last;
+    let random_bar = &random;
+
+    pool.scope(|s| {
+        s.spawn(move |_| {
+            run_sanity_region(
+                file_ref,
+                data_offset,
+                range_first,
+                sanity_samples,
+                first_bar,
+                stop_ref,
+                error_slot_ref,
+            );
+        });
+        s.spawn(move |_| {
+            run_sanity_region(
+                file_ref,
+                data_offset,
+                range_middle,
+                sanity_samples,
+                middle_bar,
+                stop_ref,
+                error_slot_ref,
+            );
+        });
+        s.spawn(move |_| {
+            run_sanity_region(
+                file_ref,
+                data_offset,
+                range_last,
+                sanity_samples,
+                last_bar,
+                stop_ref,
+                error_slot_ref,
+            );
+        });
+        s.spawn(move |_| {
+            run_random_loop(
+                file_ref,
+                data_offset,
+                n_hex_digits,
+                samples_per_window,
+                random_bar,
+                stop_ref,
+                error_slot_ref,
+            );
+        });
+    });
 
     // ---------------------------------------------------------------------
-    // Random sampling loop (unbounded until SIGINT or mismatch).
+    // Decide exit status from the shared error slot.  An error (mismatch
+    // detected) propagates as anyhow::Error; otherwise, if `stop` was set
+    // it's a user-requested SIGINT and we print a summary line.
     // ---------------------------------------------------------------------
-    pool.install(|| {
-        run_random_phase(
-            &file,
-            data_offset,
-            n_hex_digits,
-            samples_per_window,
-            &random,
-            &interrupted,
-        )
-    })
+    if let Some(err) = first_error.lock().unwrap().take() {
+        return Err(err);
+    }
+    if stop.load(Ordering::SeqCst) {
+        eprintln!("verify-hex: interrupted.");
+    }
+    Ok(())
 }
 
 // =========================================================================
@@ -179,7 +231,7 @@ impl PhaseBar {
         bar.set_prefix(prefix.to_string());
         bar.set_style(pending_bar_style());
         bar.set_message("(pending)");
-        bar.tick(); // initial render
+        bar.tick();
         Self { bar, is_spinner: false }
     }
 
@@ -205,7 +257,7 @@ impl PhaseBar {
     }
 
     /// Thread-safe increment.  `indicatif::ProgressBar::inc` uses an
-    /// internal mutex, so rayon workers can all call this concurrently.
+    /// internal mutex, so rayon workers can call this concurrently.
     fn inc(&self, n: u64) {
         self.bar.inc(n);
     }
@@ -213,14 +265,36 @@ impl PhaseBar {
     fn complete(&self) {
         if self.is_spinner {
             self.bar.disable_steady_tick();
-            // Make the spinner render as a "full" green bar at finish,
-            // taking the final position as the length.  This gives a
-            // consistent done state visually with the finite bars.
             let pos = self.bar.position();
             self.bar.set_length(pos.max(1));
         }
         self.bar.set_style(done_style());
+        // Force a redraw with the new style before marking the bar
+        // finished — without this, a bar that arrived at its final
+        // position with the old (active) style still showing on screen
+        // will not pick up the new style (the implicit draw from
+        // `finish()` is sometimes skipped when the position doesn't
+        // change).  This shows up as a sanity bar that completed at
+        // 100/100 but stays "eta 0s" instead of "done in X".
+        self.bar.tick();
         self.bar.finish();
+    }
+
+    /// Mark the phase as halted (SIGINT or a mismatch in another phase).
+    /// Position is frozen wherever the work happened to be — no jump to
+    /// the bar's full length — and the style switches to yellow with
+    /// "interrupted at {elapsed}".
+    fn interrupted(&self) {
+        if self.is_spinner {
+            self.bar.disable_steady_tick();
+            self.bar.set_style(interrupted_spinner_style());
+        } else {
+            self.bar.set_style(interrupted_bar_style());
+        }
+        self.bar.tick();
+        // `abandon` finalizes the bar without modifying its position
+        // (unlike `finish`, which jumps it to `length`).
+        self.bar.abandon();
     }
 }
 
@@ -259,8 +333,21 @@ fn done_style() -> ProgressStyle {
     .progress_chars("##-")
 }
 
-/// Spinner bars for the four conversion sub-phases.  Created in
-/// declaration order so the user sees the full plan up front.
+fn interrupted_bar_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{prefix:<24} [{bar:30.yellow}] {human_pos:>13}/{human_len:<13} interrupted at {elapsed}",
+    )
+    .unwrap()
+    .progress_chars("##-")
+}
+
+fn interrupted_spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{prefix:<24} {human_pos:>13} so far                | interrupted at {elapsed}",
+    )
+    .unwrap()
+}
+
 struct ConversionBars {
     parse: PhaseBar,
     scale: PhaseBar,
@@ -279,8 +366,6 @@ impl ConversionBars {
     }
 }
 
-/// Finite bars for the three sanity regions.  Each ticks once per BBP
-/// call (which covers 8 consecutive hex digits).
 struct SanityBars {
     first: PhaseBar,
     middle: PhaseBar,
@@ -298,7 +383,7 @@ impl SanityBars {
 }
 
 // =========================================================================
-// Conversion (decimal -> hex), driving the four conversion bars
+// Conversion (decimal -> hex)
 // =========================================================================
 
 fn convert_decimal_to_hex(
@@ -306,7 +391,6 @@ fn convert_decimal_to_hex(
     hex_path: &Path,
     bars: &ConversionBars,
 ) -> Result<()> {
-    // --- Phase 1: read + parse to Integer ---------------------------------
     bars.parse.activate();
     let content = fs::read_to_string(decimal_path)
         .with_context(|| format!("reading `{}`", decimal_path.display()))?;
@@ -321,8 +405,6 @@ fn convert_decimal_to_hex(
             decimal_path.display()
         );
     }
-    // The numerator is `pi · 10^(D-1)` as an integer: "3" followed by the
-    // fractional decimal digits.
     let digit_string = format!("3{frac_str}");
     let d_minus_1: u32 = frac_str
         .len()
@@ -335,10 +417,7 @@ fn convert_decimal_to_hex(
     bars.parse.inc(1);
     bars.parse.complete();
 
-    // --- Phase 2: build 16^H and 10^(D-1) ---------------------------------
     bars.scale.activate();
-    // H = floor(D_minus_1 · log_16(10)) hex digits of precision.
-    // log_16(10) = log(10) / log(16) = log_2(10) / 4 ≈ 0.8304.
     let log_16_10 = (10.0_f64.log2()) / 4.0;
     let h: u32 = ((d_minus_1 as f64) * log_16_10) as u32;
     let scale_hex = Integer::from(Integer::u_pow_u(16, h));
@@ -346,14 +425,12 @@ fn convert_decimal_to_hex(
     bars.scale.inc(1);
     bars.scale.complete();
 
-    // --- Phase 3: numerator · 16^H / 10^(D-1) -----------------------------
     bars.muldiv.activate();
     let product = numerator * scale_hex;
     let m = product / scale_dec;
     bars.muldiv.inc(1);
     bars.muldiv.complete();
 
-    // --- Phase 4: write hex output atomically -----------------------------
     bars.write.activate();
     let hex_str = m.to_string_radix(16);
     if !hex_str.starts_with('3') {
@@ -392,16 +469,12 @@ fn scan_hex_file(file: &File) -> Result<(u64, u64)> {
     if total_len < 2 {
         bail!("hex file is too short");
     }
-
-    // Header
     let mut header = [0_u8; 2];
     read_exact_at(file, &mut header, 0)?;
     if &header != b"3." {
         bail!("hex file doesn't start with \"3.\"");
     }
     let data_offset = 2;
-
-    // Strip trailing whitespace by scanning the tail.
     let tail_size = 4096_u64.min(total_len);
     let tail_start = total_len - tail_size;
     let mut tail = vec![0_u8; tail_size as usize];
@@ -415,92 +488,99 @@ fn scan_hex_file(file: &File) -> Result<(u64, u64)> {
             break;
         }
     }
-
     let n_hex_digits = content_end - data_offset;
     Ok((data_offset, n_hex_digits))
 }
 
 // =========================================================================
-// Sanity sweep
+// Sanity phase (one region per call; called in parallel for the three
+// regions inside `pool.scope`).
 // =========================================================================
 
-/// Returns `Ok(true)` on completion, `Ok(false)` on interrupt, `Err` on
-/// mismatch.
-fn run_sanity_phase(
+fn run_sanity_region(
     file: &File,
     data_offset: u64,
-    n_hex_digits: u64,
-    samples_per_region: usize,
-    bars: &SanityBars,
-    interrupted: &AtomicBool,
-) -> Result<bool> {
-    let one_m = 1_000_000_u64.min(n_hex_digits);
-    let half = n_hex_digits / 2;
+    range: Range<u64>,
+    samples: usize,
+    bar: &PhaseBar,
+    stop: &AtomicBool,
+    error_slot: &Mutex<Option<anyhow::Error>>,
+) {
+    // Stop was already set before this phase could start: transition the
+    // bar pending → interrupted so the user doesn't see a "(pending)"
+    // row sitting under a "verify-hex: interrupted" summary.
+    if stop.load(Ordering::SeqCst) {
+        bar.interrupted();
+        return;
+    }
+    bar.activate();
 
-    // (label, range, bar) for each region.
-    let regions: [(std::ops::Range<u64>, &PhaseBar); 3] = [
-        (0..one_m, &bars.first),
-        (
-            half..(half + one_m).min(n_hex_digits),
-            &bars.middle,
-        ),
-        (
-            n_hex_digits.saturating_sub(one_m)..n_hex_digits,
-            &bars.last,
-        ),
-    ];
+    let range_len = range.end - range.start;
+    if range_len < 8 {
+        bar.complete();
+        return;
+    }
+    let max_start = range.end - 8;
+    let positions: Vec<u64> = (0..samples)
+        .map(|i| {
+            let span = max_start - range.start;
+            let denom = (samples.saturating_sub(1)).max(1) as u64;
+            range.start + (span * i as u64) / denom
+        })
+        .collect();
 
-    for (range, bar) in regions {
-        if interrupted.load(Ordering::SeqCst) {
-            return Ok(false);
+    let result = positions.par_iter().try_for_each(|&pos| -> Result<()> {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(());
         }
-        bar.activate();
-        let range_len = range.end - range.start;
-        if range_len < 8 {
-            // Region too small to fit an 8-digit BBP window; mark done.
-            bar.complete();
-            continue;
-        }
-        let max_start = range.end - 8;
-        let positions: Vec<u64> = (0..samples_per_region)
-            .map(|i| {
-                let span = max_start - range.start;
-                range.start
-                    + (span * i as u64)
-                        / (samples_per_region.saturating_sub(1).max(1) as u64)
-            })
-            .collect();
-        check_positions(file, data_offset, &positions, bar, interrupted)?;
-        if interrupted.load(Ordering::SeqCst) {
-            return Ok(false);
-        }
+        check_position(file, data_offset, pos, stop, bar)
+    });
+
+    if let Err(e) = result {
+        record_error(error_slot, e);
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    if stop.load(Ordering::SeqCst) {
+        bar.interrupted();
+    } else {
         bar.complete();
     }
-    Ok(true)
 }
 
 // =========================================================================
-// Random sampling
+// Random sampling phase (unbounded, runs concurrently with the sanity
+// regions on the same pool).
 // =========================================================================
 
 const WINDOW_BYTES: u64 = 1_000_000;
 
-fn run_random_phase(
+fn run_random_loop(
     file: &File,
     data_offset: u64,
     n_hex_digits: u64,
     samples_per_window: usize,
     bar: &PhaseBar,
-    interrupted: &AtomicBool,
-) -> Result<()> {
+    stop: &AtomicBool,
+    error_slot: &Mutex<Option<anyhow::Error>>,
+) {
+    if stop.load(Ordering::SeqCst) {
+        bar.interrupted();
+        return;
+    }
     if n_hex_digits < 8 {
-        bail!("hex file has fewer than 8 hex digits; nothing to sample");
+        record_error(
+            error_slot,
+            anyhow!("hex file has fewer than 8 hex digits; nothing to sample"),
+        );
+        stop.store(true, Ordering::SeqCst);
+        bar.interrupted();
+        return;
     }
     bar.activate();
 
-    while !interrupted.load(Ordering::SeqCst) {
+    while !stop.load(Ordering::SeqCst) {
         let mut rng = OsRng;
-        // Window start uniform in [0, n_hex_digits - 8] inclusive.
         let max_window_start = n_hex_digits - 8;
         let p = rng.gen_range(0..=max_window_start);
         let window_end = (p + WINDOW_BYTES).min(n_hex_digits);
@@ -521,45 +601,40 @@ fn run_random_phase(
             })
             .collect();
 
-        check_positions(file, data_offset, &positions, bar, interrupted)?;
-    }
-
-    bar.complete();
-    Ok(())
-}
-
-// =========================================================================
-// Parallel check workhorse
-// =========================================================================
-
-/// Run BBP on each position in parallel, comparing the 8 hex digits
-/// returned against the bytes at the corresponding file offset.  On
-/// mismatch, returns the error from the first detected mismatch (rayon
-/// `try_for_each` short-circuits).  On interrupt, returns Ok early.
-fn check_positions(
-    file: &File,
-    data_offset: u64,
-    positions: &[u64],
-    bar: &PhaseBar,
-    interrupted: &AtomicBool,
-) -> Result<()> {
-    positions
-        .par_iter()
-        .try_for_each(|&pos| -> Result<()> {
-            // Soft-stop: if the user has Ctrl-C'd, skip remaining work
-            // without doing the BBP call.  Closures already in-flight
-            // will still complete their call (~30s at deep n).
-            if interrupted.load(Ordering::SeqCst) {
+        let result = positions.par_iter().try_for_each(|&pos| -> Result<()> {
+            if stop.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            check_position(file, data_offset, pos)?;
-            bar.inc(1);
-            Ok(())
-        })
+            check_position(file, data_offset, pos, stop, bar)
+        });
+
+        if let Err(e) = result {
+            record_error(error_slot, e);
+            stop.store(true, Ordering::SeqCst);
+            break;
+        }
+    }
+
+    // Random sampling is unbounded — exiting always means stop was set
+    // (either by SIGINT or by a mismatch somewhere).
+    bar.interrupted();
 }
 
-fn check_position(file: &File, data_offset: u64, pos: u64) -> Result<()> {
-    let bbp_digits = bbp::hex_digits_at(pos);
+// =========================================================================
+// Single-position BBP check + file compare
+// =========================================================================
+
+fn check_position(
+    file: &File,
+    data_offset: u64,
+    pos: u64,
+    stop: &AtomicBool,
+    bar: &PhaseBar,
+) -> Result<()> {
+    let bbp_digits = match bbp::hex_digits_at_interruptible(pos, stop) {
+        Some(d) => d,
+        None => return Ok(()), // BBP bailed mid-call on stop; no compare done.
+    };
 
     let mut buf = [0_u8; 8];
     read_exact_at(file, &mut buf, data_offset + pos)
@@ -588,7 +663,19 @@ fn check_position(file: &File, data_offset: u64, pos: u64) -> Result<()> {
             bbp_digits
         );
     }
+
+    bar.inc(1);
     Ok(())
+}
+
+/// Record the *first* error any phase reports; subsequent reports are
+/// dropped (the user only sees one).
+fn record_error(slot: &Mutex<Option<anyhow::Error>>, err: anyhow::Error) {
+    if let Ok(mut g) = slot.lock() {
+        if g.is_none() {
+            *g = Some(err);
+        }
+    }
 }
 
 // =========================================================================
@@ -624,7 +711,6 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<()> {
     }
     #[cfg(not(any(unix, windows)))]
     {
-        // Slow fallback for exotic platforms (not safe for concurrent calls).
         use std::io::{Read, Seek, SeekFrom};
         let mut file = file.try_clone()?;
         file.seek(SeekFrom::Start(offset))?;

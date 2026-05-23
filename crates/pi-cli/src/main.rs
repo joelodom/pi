@@ -80,10 +80,14 @@ struct Cli {
     #[arg(long, default_value_t = 100, value_name = "N", requires = "verify_hex")]
     sanity_samples: usize,
 
-    /// `--verify-hex`: number of rayon worker threads.  Defaults to all
-    /// available cores.
+    /// `--verify-hex`: maximum rayon worker threads (shared across all
+    /// parallel verification phases — first/middle/last sanity regions
+    /// plus the random loop).  Defaults to all available cores.  Rayon
+    /// work-stealing redistributes workers across phases as sanity
+    /// phases finish, so the random phase naturally absorbs freed
+    /// capacity without manual reallocation.
     #[arg(long, value_name = "J", requires = "verify_hex")]
-    jobs: Option<usize>,
+    max_jobs: Option<usize>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -119,7 +123,7 @@ fn main() -> Result<()> {
             cli.from_decimal.as_deref(),
             cli.samples_per_window,
             cli.sanity_samples,
-            cli.jobs,
+            cli.max_jobs,
         );
     }
 

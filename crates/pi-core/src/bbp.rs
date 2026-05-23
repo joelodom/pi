@@ -27,23 +27,44 @@
 //! positions we care about (~10^9).
 //!
 //! Cost: O(n) modular exponentiations of O(log n) multiplications each.
+//!
+//! ## Interruption
+//!
+//! Long-running verification callers should use [`hex_digits_at_interruptible`],
+//! which polls a `&AtomicBool` every ~10,000 iterations of the inner
+//! modular-exponentiation loop and bails (returning `None`) on stop.
+//! Without this, a single BBP call at n ≈ 10⁹ takes ~15–20 minutes on
+//! one core and SIGINT can't preempt it until it finishes.  The poll
+//! cost is one relaxed atomic load per 10⁴ iters — well under 0.01%
+//! overhead at any practical position.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Extract 8 consecutive hex digits of π's fractional expansion starting
 /// at position `n`, packed into a `u32` with the digit at position `n`
 /// in the most significant nibble.
 ///
+/// Uninterruptible — for cancellable callers see
+/// [`hex_digits_at_interruptible`].
+///
 /// `n = 0` returns `0x243F_6A88` (the first 8 hex digits of π, since
 /// π = 3.243F6A88…).
-///
-/// Reliability: at `n` up to ~10^9 (1 billion), all 8 hex digits are
-/// expected to be correct; the accumulated error in the u64 fixed-point
-/// sum is roughly `n` ULPs out of `2^64`, so the top `64 − log2(n)` bits
-/// are safe.  At `n = 10^9` that leaves ~34 reliable bits.
 pub fn hex_digits_at(n: u64) -> u32 {
-    let s1 = series_fixed(1, n);
-    let s4 = series_fixed(4, n);
-    let s5 = series_fixed(5, n);
-    let s6 = series_fixed(6, n);
+    // Pass a sentinel that's never set; the same code path used by the
+    // interruptible variant, but `None` cannot be observed here.
+    let never_set = AtomicBool::new(false);
+    hex_digits_at_interruptible(n, &never_set).expect("uninterruptible BBP returned None")
+}
+
+/// Same as [`hex_digits_at`], but polls `stop` periodically inside the
+/// inner modular-exponentiation loop and returns `None` if the flag has
+/// been set.  Designed so SIGINT can preempt a long deep-position call
+/// without waiting for the whole O(n) loop to finish.
+pub fn hex_digits_at_interruptible(n: u64, stop: &AtomicBool) -> Option<u32> {
+    let s1 = series_fixed(1, n, stop)?;
+    let s4 = series_fixed(4, n, stop)?;
+    let s5 = series_fixed(5, n, stop)?;
+    let s6 = series_fixed(6, n, stop)?;
 
     // Combined = 4·S(1) − 2·S(4) − S(5) − S(6), mod 2^64 (= mod 1 in
     // fixed-point — wrapping arithmetic does the modular reduction for us).
@@ -53,28 +74,32 @@ pub fn hex_digits_at(n: u64) -> u32 {
         .wrapping_sub(s6);
 
     // Top 32 bits = 8 hex digits starting at position n.
-    (combined >> 32) as u32
+    Some((combined >> 32) as u32)
 }
 
 /// Fractional part of `Σ_{k=0..∞} 16^(n-k) / (8k+j)`, in u64
-/// fixed-point (the returned value `v` represents `v / 2^64`).
-fn series_fixed(j: u64, n: u64) -> u64 {
+/// fixed-point.  Returns `None` if `stop` flips during the loop.
+fn series_fixed(j: u64, n: u64, stop: &AtomicBool) -> Option<u64> {
     let mut sum: u64 = 0;
 
     // Modular sum: `k` in `0..=n`, contributing `(16^(n-k) mod (8k+j)) /
-    // (8k+j)` as a fixed-point fraction.
+    // (8k+j)` as a fixed-point fraction.  Poll `stop` every CHECK_EVERY
+    // iterations — at deep n that's roughly one check every 1–3 ms.
+    const CHECK_EVERY: u64 = 10_000;
     for k in 0..=n {
+        if k % CHECK_EVERY == 0 && stop.load(Ordering::Relaxed) {
+            return None;
+        }
         let denom = 8 * k + j;
         let pow = mod_pow_16(n - k, denom);
-        // (pow / denom) as a fraction times 2^64.  `pow < denom`, so the
-        // u128 result fits in u64.
         let term_fixed = ((pow as u128) << 64) / (denom as u128);
         sum = sum.wrapping_add(term_fixed as u64);
     }
 
     // Tail: `k > n`.  Each term is bounded by `1/16^(k-n)` so the series
     // converges geometrically; ~20 terms gets us below the u64 fixed-point
-    // representable threshold.
+    // representable threshold.  No interrupt check needed — this loop is
+    // microseconds.
     let mut tail = 0.0_f64;
     for offset in 1_i32..=20 {
         let k = n + offset as u64;
@@ -87,7 +112,7 @@ fn series_fixed(j: u64, n: u64) -> u64 {
         tail += term;
     }
     let tail_fixed = (tail * 2.0_f64.powi(64)) as u64;
-    sum.wrapping_add(tail_fixed)
+    Some(sum.wrapping_add(tail_fixed))
 }
 
 /// `16^exp mod m` via binary exponentiation in `u128`.
@@ -168,5 +193,25 @@ mod tests {
         // and the modular arithmetic doesn't overflow.
         let d = hex_digits_at(10_000);
         let _ = d;
+    }
+
+    #[test]
+    fn interrupt_returns_none_quickly() {
+        // Flag set before the call: should return None on the very first
+        // iteration without doing any meaningful work.
+        let stop = AtomicBool::new(true);
+        assert_eq!(hex_digits_at_interruptible(10_000_000, &stop), None);
+    }
+
+    #[test]
+    fn no_interrupt_matches_uninterruptible() {
+        let stop = AtomicBool::new(false);
+        for &n in &[0_u64, 1, 7, 8, 100, 999] {
+            assert_eq!(
+                hex_digits_at(n),
+                hex_digits_at_interruptible(n, &stop).unwrap(),
+                "mismatch at n={n}"
+            );
+        }
     }
 }
