@@ -323,9 +323,30 @@ impl CliProgress {
         }
     }
 
-    fn phase_style() -> ProgressStyle {
+    fn pending_style() -> ProgressStyle {
+        // Plain (no color) bar with a `{msg}` slot for "(pending)".
         ProgressStyle::with_template(
-            "{prefix:<22} [{bar:30.cyan/blue}] {human_pos:>13}/{human_len:<13} {msg}",
+            "{prefix:<22} [{bar:30}] {human_pos:>13}/{human_len:<13} {msg}",
+        )
+        .unwrap()
+        .progress_chars("##-")
+    }
+
+    fn active_style() -> ProgressStyle {
+        // Cyan-on-blue running bar with live ETA.
+        ProgressStyle::with_template(
+            "{prefix:<22} [{bar:30.cyan/blue}] {human_pos:>13}/{human_len:<13} eta {eta}",
+        )
+        .unwrap()
+        .progress_chars("##-")
+    }
+
+    fn done_style() -> ProgressStyle {
+        // Green completed bar with the total time the phase took.  We
+        // reset the elapsed counter at `start_phase`, so `{elapsed}`
+        // here is per-phase, not pipeline-cumulative.
+        ProgressStyle::with_template(
+            "{prefix:<22} [{bar:30.green}] {human_pos:>13}/{human_len:<13} done in {elapsed}",
         )
         .unwrap()
         .progress_chars("##-")
@@ -333,7 +354,6 @@ impl CliProgress {
 
     fn install_bar(&mut self, name: &str, total: u64) -> usize {
         let bar = self.multi.add(ProgressBar::new(total));
-        bar.set_style(Self::phase_style());
         bar.set_prefix(name.to_string());
         self.bars.push(bar);
         let idx = self.bars.len() - 1;
@@ -347,6 +367,7 @@ impl ProgressReporter for CliProgress {
         for p in phases {
             let idx = self.install_bar(p.name, p.total);
             let bar = &self.bars[idx];
+            bar.set_style(Self::pending_style());
             bar.set_message("(pending)");
             // Force an initial draw so all phases are visible before the
             // first one starts ticking.
@@ -360,9 +381,14 @@ impl ProgressReporter for CliProgress {
             None => self.install_bar(name, total),
         };
         let bar = &self.bars[idx];
+        bar.set_style(Self::active_style());
         bar.set_length(total);
-        bar.set_message("");
         bar.set_position(0);
+        // Per-phase elapsed/eta timing.  Bars created at `set_phases`
+        // time would otherwise report elapsed time relative to pipeline
+        // start, not to when their own phase began.
+        bar.reset_elapsed();
+        bar.reset_eta();
         self.current = Some(idx);
         self.counter = 0;
         self.tick_every = (total / 100).max(1);
@@ -382,7 +408,8 @@ impl ProgressReporter for CliProgress {
             let bar = &self.bars[idx];
             let total = bar.length().unwrap_or(self.counter);
             bar.set_position(total);
-            bar.finish_with_message("done");
+            bar.set_style(Self::done_style());
+            bar.finish();
         }
     }
 }
