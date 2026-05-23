@@ -1,9 +1,16 @@
-//! `pi` — CLI for computing pi to a chosen number of decimal digits.
+//! `pi` — CLI for computing pi and verifying digit files.
 //!
-//! The CLI's job is to parse arguments, wire up a [`DigitSink`] and a
-//! [`ProgressReporter`], hand them to a [`PiAlgorithm`], and time the run.
-//! All compute logic lives in `pi-core`.
+//! Two modes, picked by which flags are given:
+//!   * Compute (`--digits`, `-o`, ...): drive a [`PiAlgorithm`] to produce
+//!     N digits and stream them through a [`DigitSink`].
+//!   * Verify (`--verify A B`): byte-by-byte compare two digit files,
+//!     ignoring trailing whitespace.  The shorter file's content must
+//!     match the matching prefix of the longer file's content.
+//!
+//! Running `pi` with no arguments prints the help text.
 
+use std::fs::File;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -18,8 +25,9 @@ use pi_core::{AlgorithmKind, DigitSink, ProgressReporter};
 #[derive(Parser, Debug)]
 #[command(
     name = "pi",
-    about = "Compute pi to a chosen number of decimal digits.",
-    version
+    about = "Compute pi to N decimal digits, or verify a digit file against a reference.",
+    version,
+    arg_required_else_help = true
 )]
 struct Cli {
     /// Number of decimal digits to compute (counting the leading "3").
@@ -34,17 +42,16 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = AlgorithmFlag::Chudnovsky)]
     algorithm: AlgorithmFlag,
 
-    /// Suppress the progress reporter.  Progress is always written to
-    /// stderr, so this is only useful when stderr is a terminal you'd
-    /// rather keep clean.
+    /// Suppress the progress reporter (progress goes to stderr).
     #[arg(long)]
     no_progress: bool,
 
-    /// After computing, compare the first 100 digits against a hardcoded
-    /// reference value and report whether it matches.  Requires `-o
-    /// <FILE>` (we read the output back to verify).
-    #[arg(long)]
-    verify: bool,
+    /// Verify two digit files against each other instead of computing.
+    /// Trims trailing whitespace on both, then byte-by-byte compares the
+    /// shorter file's content against the matching prefix of the longer
+    /// file's content.  Skips computation entirely.
+    #[arg(long, value_names = ["FILE_A", "FILE_B"], num_args = 2)]
+    verify: Option<Vec<PathBuf>>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -63,6 +70,22 @@ impl From<AlgorithmFlag> for AlgorithmKind {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    if let Some(files) = cli.verify.as_deref() {
+        // clap's `num_args = 2` guarantees the slice has exactly two
+        // entries, but assert defensively so the indexing never panics
+        // silently if that constraint ever changes.
+        assert_eq!(files.len(), 2, "--verify takes exactly two file arguments");
+        return run_verify(&files[0], &files[1]);
+    }
+
+    run_compute(cli)
+}
+
+// ---------------------------------------------------------------------------
+// Compute mode.
+// ---------------------------------------------------------------------------
+
+fn run_compute(cli: Cli) -> Result<()> {
     let algorithm = AlgorithmKind::from(cli.algorithm).build();
     let writing_to_stdout = cli.output == "-";
 
@@ -91,56 +114,150 @@ fn main() -> Result<()> {
     let elapsed = start.elapsed();
     eprintln!("done in {:.3?}", elapsed);
 
-    if cli.verify {
-        if writing_to_stdout {
-            eprintln!("--verify requires writing to a file; rerun with -o <FILE>");
-        } else {
-            verify_known_prefix(&PathBuf::from(&cli.output), cli.digits)?;
-        }
+    if !writing_to_stdout {
+        eprintln!("output written to {}", cli.output);
+        eprintln!(
+            "to verify byte-by-byte against a reference file:\n  pi --verify {} <REFERENCE>",
+            cli.output
+        );
     }
 
     Ok(())
 }
 
-// First 100 digits of pi, counting the leading `3` — i.e. one integer
-// digit and 99 fractional digits.  Used by `--verify` to sanity-check the
-// computed output.
-const FIRST_100: &str = "3.141592653589793238462643383279502884197169399375105820974944592307816406286208998628034825342117067";
+// ---------------------------------------------------------------------------
+// Verify mode.
+// ---------------------------------------------------------------------------
 
-fn verify_known_prefix(path: &Path, digits_requested: u64) -> Result<()> {
-    use std::fs::File;
-    use std::io::{BufReader, Read};
+/// Byte-by-byte compare two digit files, ignoring trailing whitespace.
+///
+/// Trims trailing `' '`, `'\t'`, `'\n'`, `'\r'` from both files, then
+/// compares the shorter content against the matching prefix of the
+/// longer content.  Returns `Ok(())` on match; bails with the first
+/// differing byte offset on mismatch.
+fn run_verify(file_a: &Path, file_b: &Path) -> Result<()> {
+    let a_len = file_content_length(file_a)
+        .with_context(|| format!("scanning `{}`", file_a.display()))?;
+    let b_len = file_content_length(file_b)
+        .with_context(|| format!("scanning `{}`", file_b.display()))?;
+    let common = a_len.min(b_len);
 
-    // We can check up to 100 digits.  An n-digit output occupies n + 1 chars
-    // in the file (one for the decimal point) when n >= 2, or just 1 char
-    // when n = 1.
-    let n = (digits_requested as usize).min(100);
-    let want_chars = if n <= 1 { n } else { n + 1 };
-    let expected = &FIRST_100[..want_chars];
+    let mut a = BufReader::with_capacity(1 << 20, File::open(file_a)?);
+    let mut b = BufReader::with_capacity(1 << 20, File::open(file_b)?);
 
-    let mut reader = BufReader::new(
-        File::open(path).with_context(|| format!("opening `{}` for verification", path.display()))?,
-    );
-    let mut buf = vec![0u8; want_chars];
-    reader.read_exact(&mut buf)?;
-    let got = std::str::from_utf8(&buf)?;
+    const CHUNK: usize = 64 * 1024;
+    let mut buf_a = vec![0u8; CHUNK];
+    let mut buf_b = vec![0u8; CHUNK];
+    let mut pos: u64 = 0;
 
-    if got == expected {
-        eprintln!("verify: first {} digits match the known reference", n);
-        Ok(())
+    while pos < common {
+        let to_read = ((common - pos).min(CHUNK as u64)) as usize;
+        a.read_exact(&mut buf_a[..to_read])?;
+        b.read_exact(&mut buf_b[..to_read])?;
+
+        if buf_a[..to_read] != buf_b[..to_read] {
+            for i in 0..to_read {
+                if buf_a[i] != buf_b[i] {
+                    let offset = pos + i as u64;
+                    eprintln!("verify: differ at byte offset {}", offset);
+                    eprintln!(
+                        "  {}: 0x{:02x} {}",
+                        file_a.display(),
+                        buf_a[i],
+                        describe_byte(buf_a[i])
+                    );
+                    eprintln!(
+                        "  {}: 0x{:02x} {}",
+                        file_b.display(),
+                        buf_b[i],
+                        describe_byte(buf_b[i])
+                    );
+                    anyhow::bail!("verify failed at offset {}", offset);
+                }
+            }
+        }
+        pos += to_read as u64;
+    }
+
+    if a_len == b_len {
+        eprintln!(
+            "verify: {} and {} are identical ({} content bytes)",
+            file_a.display(),
+            file_b.display(),
+            common
+        );
     } else {
-        eprintln!("verify: MISMATCH in first {} chars", want_chars);
-        eprintln!("  expected: {}", expected);
-        eprintln!("  got     : {}", got);
-        anyhow::bail!("verification failed");
+        let (short_path, short_len, long_path, long_len) = if a_len < b_len {
+            (file_a, a_len, file_b, b_len)
+        } else {
+            (file_b, b_len, file_a, a_len)
+        };
+        eprintln!(
+            "verify: all {} content bytes of {} match the prefix of {} ({} content bytes total)",
+            short_len,
+            short_path.display(),
+            long_path.display(),
+            long_len
+        );
+    }
+    Ok(())
+}
+
+/// Length of `path` excluding any trailing run of whitespace (` `, `\t`,
+/// `\n`, `\r`).
+///
+/// Scans backwards in 4 KiB chunks so the whole file never has to fit in
+/// memory — important when verifying against the 100M-digit reference.
+fn file_content_length(path: &Path) -> Result<u64> {
+    let mut f = File::open(path).with_context(|| format!("opening `{}`", path.display()))?;
+    let total_len = f.metadata()?.len();
+    if total_len == 0 {
+        return Ok(0);
+    }
+
+    const CHUNK: u64 = 4096;
+    let mut buf = vec![0u8; CHUNK as usize];
+    let mut end = total_len;
+
+    while end > 0 {
+        let read_size = CHUNK.min(end);
+        let start = end - read_size;
+        f.seek(SeekFrom::Start(start))?;
+        f.read_exact(&mut buf[..read_size as usize])?;
+
+        for i in (0..read_size as usize).rev() {
+            let c = buf[i];
+            if !matches!(c, b' ' | b'\t' | b'\n' | b'\r') {
+                return Ok(start + i as u64 + 1);
+            }
+        }
+
+        end = start;
+    }
+
+    Ok(0)
+}
+
+fn describe_byte(b: u8) -> String {
+    match b {
+        b' ' => "(space)".to_string(),
+        b'\t' => "(tab)".to_string(),
+        b'\n' => "(LF)".to_string(),
+        b'\r' => "(CR)".to_string(),
+        c if c.is_ascii_graphic() => format!("('{}')", c as char),
+        c => format!("(non-printable {})", c),
     }
 }
 
+// ---------------------------------------------------------------------------
+// Progress reporting.
+// ---------------------------------------------------------------------------
+
 /// `indicatif`-backed [`ProgressReporter`].
 ///
-/// We only update the bar's position about 100 times per phase regardless of
-/// how often `tick` is called, to keep the inner loop cheap.  Indicatif also
-/// rate-limits redraws to ~15 Hz, so this is mostly belt-and-suspenders.
+/// We only update the bar's position about 100 times per phase regardless
+/// of how often `tick` is called, to keep the inner loop cheap.  Indicatif
+/// also rate-limits redraws to ~15 Hz, so this is mostly belt-and-braces.
 struct CliProgress {
     bar: Option<ProgressBar>,
     counter: u64,

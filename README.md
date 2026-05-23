@@ -15,11 +15,18 @@ in a few seconds on a modern laptop.
 # takes a few minutes; subsequent builds are fast).
 cargo build --release
 
+# Show help (this is also what bare `pi` prints — no arguments => help).
+./target/release/pi
+
 # Compute 1,000,000 digits and write them to pi.txt.
 ./target/release/pi --digits 1000000 -o pi.txt
 
-# Verify against a known reference value for the first 100 digits.
-./target/release/pi --digits 1000000 -o pi.txt --verify
+# Verify pi.txt against a trusted reference file.  Trailing whitespace is
+# ignored on both sides, and the shorter file's content is compared
+# against the matching prefix of the longer one — so a freshly computed
+# 1M-digit pi.txt will succeed against a 100M-digit reference if it agrees
+# on the first 1M digits.
+./target/release/pi --verify pi.txt pi3-100-million.txt
 
 # Compute 100 digits to stdout.
 ./target/release/pi --digits 100
@@ -29,13 +36,26 @@ Run `./target/release/pi --help` for the full flag list.
 
 ## CLI
 
+`pi` has two modes, picked by which flags are given:
+
+* **Compute** — `pi --digits N [-o FILE] [--algorithm ALG] [--no-progress]`.
+  After writing to a file, the CLI prints the suggested `pi --verify ...`
+  invocation.
+* **Verify** — `pi --verify FILE_A FILE_B`.  Trims trailing whitespace
+  (`' '`, `'\t'`, `'\n'`, `'\r'`) from both files, then byte-by-byte
+  compares the shorter content against the matching prefix of the longer
+  content.  On mismatch it reports the first differing byte offset and
+  exits non-zero.  Skips computation entirely.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-d, --digits N` | `1000000` | Decimal digits to compute (counting the leading `3`). |
 | `-o, --output FILE` | `-` | File to write digits to. Use `-` for stdout. |
 | `--algorithm NAME` | `chudnovsky` | Algorithm to use. Currently only `chudnovsky` is available. |
 | `--no-progress` | | Suppress the progress bar (it goes to stderr). |
-| `--verify` | | After computing, check the first 100 digits against a hardcoded reference. Requires `-o FILE`. |
+| `--verify FILE_A FILE_B` | | Byte-by-byte compare two digit files, ignoring trailing whitespace. Runs instead of compute. |
+
+Running `pi` with no arguments prints the help text.
 
 ## Repository layout
 
