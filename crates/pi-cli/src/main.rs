@@ -103,7 +103,7 @@ fn run_compute(cli: Cli) -> Result<()> {
     // Print the plan before opening anything so a typo in --digits or -o
     // can be spotted (and ^C'd) before the slow work starts.
     eprintln!("computing pi:");
-    eprintln!("  digits:    {}", cli.digits);
+    eprintln!("  digits:    {}", fmt_thousands(cli.digits));
     eprintln!("  algorithm: {}", algorithm.name());
     eprintln!(
         "  output:    {}",
@@ -128,7 +128,11 @@ fn run_compute(cli: Cli) -> Result<()> {
     let start = Instant::now();
     algorithm.compute(cli.digits, &mut *sink, &mut *progress)?;
     let elapsed = start.elapsed();
-    eprintln!("done in {:.3?}", elapsed);
+    eprintln!(
+        "done: {} digits in {:.3?}",
+        fmt_thousands(cli.digits),
+        elapsed
+    );
 
     if !writing_to_stdout {
         eprintln!("output written to {}", cli.output);
@@ -175,7 +179,7 @@ fn run_verify(file_a: &Path, file_b: &Path) -> Result<()> {
             for i in 0..to_read {
                 if buf_a[i] != buf_b[i] {
                     let offset = pos + i as u64;
-                    eprintln!("verify: differ at byte offset {}", offset);
+                    eprintln!("verify: differ at byte offset {}", fmt_thousands(offset));
                     eprintln!(
                         "  {}: 0x{:02x} {}",
                         file_a.display(),
@@ -188,7 +192,7 @@ fn run_verify(file_a: &Path, file_b: &Path) -> Result<()> {
                         buf_b[i],
                         describe_byte(buf_b[i])
                     );
-                    anyhow::bail!("verify failed at offset {}", offset);
+                    anyhow::bail!("verify failed at offset {}", fmt_thousands(offset));
                 }
             }
         }
@@ -200,7 +204,7 @@ fn run_verify(file_a: &Path, file_b: &Path) -> Result<()> {
             "verify: {} and {} are identical ({} content bytes)",
             file_a.display(),
             file_b.display(),
-            common
+            fmt_thousands(common)
         );
     } else {
         let (short_path, short_len, long_path, long_len) = if a_len < b_len {
@@ -210,10 +214,10 @@ fn run_verify(file_a: &Path, file_b: &Path) -> Result<()> {
         };
         eprintln!(
             "verify: all {} content bytes of {} match the prefix of {} ({} content bytes total)",
-            short_len,
+            fmt_thousands(short_len),
             short_path.display(),
             long_path.display(),
-            long_len
+            fmt_thousands(long_len)
         );
     }
     Ok(())
@@ -252,6 +256,20 @@ fn file_content_length(path: &Path) -> Result<u64> {
     }
 
     Ok(0)
+}
+
+/// Render `n` with `,` as a thousands separator (e.g. `1_234_567` -> `"1,234,567"`).
+fn fmt_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(bytes.len() + bytes.len() / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
 }
 
 fn describe_byte(b: u8) -> String {
