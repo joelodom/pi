@@ -6,9 +6,10 @@
 //! * [`algorithm::PiAlgorithm`] — picks the math.  Chudnovsky (default,
 //!   fastest) and Gauss-Legendre (independent cross-check) are
 //!   implemented; future algorithms slot in here.
-//! * [`output::DigitSink`] — picks where digits go (stdout, file, chunked
-//!   file series, mmap, network).  The algorithm never sees the concrete
-//!   destination.
+//! * [`output::DigitSink`] — picks where digits go.  Currently stdout
+//!   and single-file backends are implemented; the algorithm never sees
+//!   the concrete destination, so adding new ones (chunked file series,
+//!   network, …) doesn't touch the compute code.
 //! * [`progress::ProgressReporter`] — picks how progress is reported
 //!   (silent, indicatif, log).  Algorithms call [`progress::ProgressReporter::set_phases`]
 //!   up front so multi-phase reporters can show upcoming work.
@@ -21,7 +22,8 @@
 //!
 //! Big-number arithmetic uses GMP/MPFR via the `rug` crate; at Chudnovsky
 //! scale this is by far the heaviest part of the computation, and GMP's
-//! FFT multiplication is what makes a million-digit run finish in seconds.
+//! FFT multiplication is what makes a billion-digit run finish in minutes
+//! and a million-digit run finish in well under a second.
 
 pub mod algorithm;
 pub mod bbp;

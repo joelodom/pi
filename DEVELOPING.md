@@ -117,7 +117,9 @@ more.
   materializes the full ~D-digit string in memory. Chunked output
   (write 100 MB at a time, free that chunk, emit the next) would
   reduce peak memory by another ~`D` bytes. The `DigitSink` interface
-  already supports streaming.
+  allows multiple `write_fractional_digits` calls, so the contract
+  already permits this — only the caller (`write_decimal_digits`)
+  needs to be reworked.
 
 ### Phase 3 — disk-backed bignum (necessary for >100B)
 

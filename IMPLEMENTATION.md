@@ -166,9 +166,10 @@ decimal-conversion phase allocates its own large buffers.
 operates on it in place:
 
 ```rust
+// Sketch — error handling and a defensive length pad omitted.
 pi *= &scale;                 // pi := pi · 10^(D-1)
 drop(scale);                  // free a full-precision Float
-let (int_part, _) = pi.to_integer_round(Down).unwrap();
+let (int_part, _) = pi.to_integer_round(Round::Down)?;
 drop(pi);                     // free another full-precision Float
 let s = int_part.to_string();
 drop(int_part);
@@ -246,7 +247,7 @@ Notes:
 - The `k > n` tail decays geometrically by a factor of 16 per step,
   so summing ~20 terms in `f64` is precise enough.
 - The interrupt poll every 10,000 inner iterations costs about one
-  atomic load per millisecond of CPU work — well under 0.1% overhead.
+  atomic load per millisecond of CPU work — well under 0.01% overhead.
   Without it, an in-flight BBP call at deep `n` is uninterruptible for
   ~15–20 minutes; with it, SIGINT lands within milliseconds.
 

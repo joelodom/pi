@@ -66,8 +66,10 @@ pub fn stdout_sink() -> WriterSink<BufWriter<Stdout>> {
     WriterSink::new(BufWriter::with_capacity(64 * 1024, io::stdout()))
 }
 
-/// Construct a buffered single-file sink.  Uses a 1 MiB write buffer because
-/// the digits arrive in one big string at the end of the computation.
+/// Construct a buffered single-file sink.  Uses a 1 MiB write buffer
+/// because the fractional digits currently arrive in a single
+/// multi-gigabyte `write_fractional_digits` call at the end of the
+/// computation; smaller buffers would mean many more syscalls.
 pub fn file_sink(path: impl AsRef<Path>) -> io::Result<WriterSink<BufWriter<File>>> {
     let file = File::create(path)?;
     Ok(WriterSink::new(BufWriter::with_capacity(1 << 20, file)))

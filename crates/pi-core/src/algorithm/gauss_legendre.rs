@@ -103,9 +103,11 @@ impl PiAlgorithm for GaussLegendre {
             b.sqrt_mut();
             let mut t = Float::with_val_64(prec, 0.25_f64);
             let mut p = Integer::from(1);
-            // Pre-allocated scratch Floats reused every iteration.  Avoid
-            // 4 full-precision Float allocations per iteration (~16 GB of
-            // alloc churn at 10B digits over ~32 iterations).
+            // Pre-allocated scratch Floats reused every iteration.  At
+            // 10B digits each Float is ~4 GB, so 4 scratch Floats are
+            // ~16 GB of live mantissa per iteration; without reuse we'd
+            // be allocating and freeing all 16 GB every step (~512 GB of
+            // cumulative allocator traffic across ~32 iterations).
             let mut a_new = Float::with_val_64(prec, 0);
             let mut b_new = Float::with_val_64(prec, 0);
             let mut diff = Float::with_val_64(prec, 0);

@@ -180,13 +180,13 @@ c_{n+1}  ≈  cₙ² / (4 · M)
 ```
 
 So each iteration roughly doubles the number of correct digits. About
-35 iterations gets you to a billion correct digits. (Brent calls this
+33 iterations gets you to a billion correct digits. (Brent calls this
 "halving the distance you have left to go, twice.")
 
 For comparison: Chudnovsky's series adds *linearly* with the term
 count — about 14 digits per term — and needs ~70 million terms for a
-billion digits. The AGM gets there in 35 iterations. The per-iteration
-work is heavier, but the iteration count is comically smaller.
+billion digits. The AGM gets there in 33. The per-iteration work is
+heavier, but the iteration count is comically smaller.
 
 ### The Brent-Salamin formula
 
@@ -274,8 +274,12 @@ Split the sum at `k = n`:
   enough to pin down the fractional part to full precision.
 
 Cost: roughly `O(n)` modular exponentiations of small integers, each
-`O(log n)` machine ops. Total: `O(n · log n)` machine ops per hex
-digit. At `n = 10⁹`, that's about 30 seconds on one core.
+`O(log n)` machine ops. Total: `O(n · log n)` machine ops per
+8-hex-digit extraction. The asymptotic is friendly; the constant
+factor is not — the inner loop is dominated by `u128 % m`, and in
+this implementation a single 8-digit extraction at `n = 10⁹` takes
+roughly 15–20 minutes on one core. That's why verification samples
+deep positions sparingly.
 
 ### Why this is wild
 
@@ -283,7 +287,7 @@ There is no known formula like this for **base 10**.
 
 Bellard (1997) found an algorithm that extracts individual *decimal*
 digits, but it's `O(n²)` — at `n = 10⁹` that means weeks per decimal
-digit, where hex BBP needs 30 seconds. The asymptotic gap reflects a
+digit, where hex BBP needs minutes. The asymptotic gap reflects a
 deep structural fact: π has identities that play nicely with binary
 arithmetic in a way it doesn't with base 10.
 
