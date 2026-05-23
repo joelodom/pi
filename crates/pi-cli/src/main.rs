@@ -89,6 +89,27 @@ fn run_compute(cli: Cli) -> Result<()> {
     let algorithm = AlgorithmKind::from(cli.algorithm).build();
     let writing_to_stdout = cli.output == "-";
 
+    // Fail fast if a regular file already exists at the output path, so a
+    // typo in `-o` doesn't clobber an expensive previous run.  We only
+    // guard against existing regular files — special destinations like
+    // `/dev/null` still work.
+    if !writing_to_stdout && Path::new(&cli.output).is_file() {
+        anyhow::bail!(
+            "output file `{}` already exists; refusing to overwrite (delete it or pick a different -o)",
+            cli.output
+        );
+    }
+
+    // Print the plan before opening anything so a typo in --digits or -o
+    // can be spotted (and ^C'd) before the slow work starts.
+    eprintln!("computing pi:");
+    eprintln!("  digits:    {}", cli.digits);
+    eprintln!("  algorithm: {}", algorithm.name());
+    eprintln!(
+        "  output:    {}",
+        if writing_to_stdout { "stdout" } else { &cli.output }
+    );
+
     let mut sink: Box<dyn DigitSink> = if writing_to_stdout {
         Box::new(stdout_sink())
     } else {
@@ -104,11 +125,6 @@ fn run_compute(cli: Cli) -> Result<()> {
         Box::new(CliProgress::new())
     };
 
-    eprintln!(
-        "computing {} digits of pi via {}",
-        cli.digits,
-        algorithm.name()
-    );
     let start = Instant::now();
     algorithm.compute(cli.digits, &mut *sink, &mut *progress)?;
     let elapsed = start.elapsed();
