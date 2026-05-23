@@ -12,6 +12,7 @@ repository = ""
 pi-core = { path = "crates/pi-core" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+gmp-mpfr-sys = { version = "1.7", default-features = false, features = ["mpfr"] }
 indicatif = "0.17"
 rug = { version = "1.24", default-features = false, features = ["integer", "float"] }
 

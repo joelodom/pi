@@ -8,4 +8,5 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+gmp-mpfr-sys.workspace = true
 rug.workspace = true

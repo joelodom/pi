@@ -32,14 +32,14 @@
 //! the top of the recursion, so the dominant cost is a single GMP
 //! multiplication of two `D`-digit numbers — O(M(D) · log D) total.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use rug::float::Round;
 use rug::ops::{Pow, PowAssign};
 use rug::{Float, Integer};
 
 use crate::output::DigitSink;
 use crate::precision::PrecisionPlan;
-use crate::progress::ProgressReporter;
+use crate::progress::{Phase, ProgressReporter};
 
 use super::PiAlgorithm;
 
@@ -77,11 +77,27 @@ impl PiAlgorithm for Chudnovsky {
 
         let plan = PrecisionPlan::for_digits(digits, DIGITS_PER_TERM)?;
 
-        progress.start_phase("binary splitting", plan.terms);
+        // Widen MPFR's allowed exponent range.  At D digits, the
+        // `pi *= &q` step temporarily has magnitude ~10^D — for a
+        // billion digits that's exponent ~3.3·10^9 binary, well past
+        // MPFR's default emax (2^30 - 1) and would otherwise overflow to
+        // +∞ silently.  This is a process-global change, but widening
+        // the range is harmless for Floats with small magnitudes.
+        widen_mpfr_exponent_range_for(digits)?;
+
+        // Declare the upcoming phases up front so reporters can show the
+        // full pipeline (including what's still pending).
+        progress.set_phases(&[
+            Phase { name: PHASE_BINARY_SPLITTING, total: plan.terms },
+            Phase { name: PHASE_FINAL_ASSEMBLY, total: 4 },
+            Phase { name: PHASE_DECIMAL_CONVERSION, total: 1 },
+        ]);
+
+        progress.start_phase(PHASE_BINARY_SPLITTING, plan.terms);
         let (_p, q, t) = binary_split(1, plan.terms + 1, progress);
         progress.end_phase();
 
-        progress.start_phase("final assembly", 4);
+        progress.start_phase(PHASE_FINAL_ASSEMBLY, 4);
         // S = (A · Q + T) / Q, where T/Q sums terms k = 1..N and A is the
         // k = 0 contribution.
         let denom_int = Integer::from(A) * &q + &t;
@@ -99,13 +115,54 @@ impl PiAlgorithm for Chudnovsky {
         progress.tick();
         progress.end_phase();
 
-        progress.start_phase("decimal conversion", 1);
+        progress.start_phase(PHASE_DECIMAL_CONVERSION, 1);
         write_decimal_digits(&pi, digits, sink)?;
         progress.tick();
         progress.end_phase();
 
         Ok(())
     }
+}
+
+const PHASE_BINARY_SPLITTING: &str = "binary splitting";
+const PHASE_FINAL_ASSEMBLY: &str = "final assembly";
+const PHASE_DECIMAL_CONVERSION: &str = "decimal conversion";
+
+/// Push MPFR's allowed exponent range out to its hardware maximum so the
+/// O(10^D)-magnitude intermediates during binary splitting don't trigger
+/// silent overflow to +∞.  The change is process-global, but a widened
+/// range is harmless for any Float with a small magnitude.
+fn widen_mpfr_exponent_range_for(digits: u64) -> Result<()> {
+    use gmp_mpfr_sys::mpfr;
+    use std::f64::consts::LOG2_10;
+
+    // Conservative estimate of the largest binary exponent we'll need:
+    // log2(10) · D, plus generous margin for the inner multiplications
+    // (each `pi *= ...` can grow the exponent).
+    let needed_exp = (digits as f64 * LOG2_10).ceil() as i128 + 1024;
+
+    // Safety: every gmp_mpfr_sys call here only reads or writes MPFR's
+    // global emin/emax thread-local state through the documented MPFR
+    // API.  None of them dereferences any pointer we hand in.
+    unsafe {
+        let emax_max = mpfr::get_emax_max();
+        let emin_min = mpfr::get_emin_min();
+        if needed_exp > emax_max as i128 {
+            bail!(
+                "{} digits requires an MPFR exponent up to {}, exceeding the platform cap ({})",
+                digits,
+                needed_exp,
+                emax_max
+            );
+        }
+        if mpfr::set_emax(emax_max) != 0 {
+            bail!("failed to widen MPFR emax to {}", emax_max);
+        }
+        if mpfr::set_emin(emin_min) != 0 {
+            bail!("failed to widen MPFR emin to {}", emin_min);
+        }
+    }
+    Ok(())
 }
 
 /// Binary splitting over the half-open range `[a, b)` of Chudnovsky terms.

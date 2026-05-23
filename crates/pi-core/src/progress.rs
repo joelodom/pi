@@ -4,9 +4,27 @@
 //! structured logging, telemetry, no-op).  The algorithms call into this
 //! trait between phases and at each unit of work, so all I/O for progress
 //! lives outside `pi-core`.
+//!
+//! Algorithms that know their phases up front call [`ProgressReporter::set_phases`]
+//! once before any [`ProgressReporter::start_phase`], so a backend that
+//! supports persistent multi-phase visuals can pre-render the upcoming
+//! phases alongside the running one.
+
+/// Descriptor for a phase the algorithm intends to run.
+#[derive(Debug, Clone, Copy)]
+pub struct Phase {
+    pub name: &'static str,
+    pub total: u64,
+}
 
 /// Receives progress notifications from a running computation.
 pub trait ProgressReporter {
+    /// Declare the full ordered sequence of phases up front.  Reporters
+    /// that support persistent multi-phase visuals (like the CLI's
+    /// multi-progress-bar backend) use this to render upcoming phases.
+    /// Reporters that don't need this default to a no-op.
+    fn set_phases(&mut self, _phases: &[Phase]) {}
+
     /// Called when a named phase begins, with the expected total units.
     fn start_phase(&mut self, name: &str, total: u64);
 

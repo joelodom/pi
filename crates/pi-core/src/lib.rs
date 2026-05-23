@@ -26,4 +26,4 @@ pub mod progress;
 pub use algorithm::{AlgorithmKind, PiAlgorithm};
 pub use output::DigitSink;
 pub use precision::PrecisionPlan;
-pub use progress::{NoopProgress, ProgressReporter};
+pub use progress::{NoopProgress, Phase, ProgressReporter};

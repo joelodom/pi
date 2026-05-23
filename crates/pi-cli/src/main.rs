@@ -9,6 +9,7 @@
 //!
 //! Running `pi` with no arguments prints the help text.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -16,11 +17,11 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use pi_core::output::{file_sink, stdout_sink};
 use pi_core::progress::NoopProgress;
-use pi_core::{AlgorithmKind, DigitSink, ProgressReporter};
+use pi_core::{AlgorithmKind, DigitSink, Phase, ProgressReporter};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -289,50 +290,99 @@ fn describe_byte(b: u8) -> String {
 
 /// `indicatif`-backed [`ProgressReporter`].
 ///
-/// We only update the bar's position about 100 times per phase regardless
-/// of how often `tick` is called, to keep the inner loop cheap.  Indicatif
-/// also rate-limits redraws to ~15 Hz, so this is mostly belt-and-braces.
+/// When the algorithm declares its phases via `set_phases`, one
+/// progress bar is created per phase and stacked into a [`MultiProgress`]
+/// up front, so the user sees the whole pipeline (pending phases,
+/// running phase, completed phases) at a glance.
+///
+/// If the algorithm doesn't pre-declare phases, bars are added lazily
+/// the first time each phase starts — the old single-bar behavior in
+/// "scrolling" form.
+///
+/// The inner loop only updates the bar's position about 100 times per
+/// phase regardless of how often `tick` is called, to keep the loop
+/// cheap.  Indicatif also rate-limits redraws to ~15 Hz internally.
 struct CliProgress {
-    bar: Option<ProgressBar>,
+    multi: MultiProgress,
+    bars: Vec<ProgressBar>,
+    name_to_idx: HashMap<String, usize>,
+    current: Option<usize>,
     counter: u64,
     tick_every: u64,
 }
 
 impl CliProgress {
     fn new() -> Self {
-        Self { bar: None, counter: 0, tick_every: 1 }
+        Self {
+            multi: MultiProgress::new(),
+            bars: Vec::new(),
+            name_to_idx: HashMap::new(),
+            current: None,
+            counter: 0,
+            tick_every: 1,
+        }
+    }
+
+    fn phase_style() -> ProgressStyle {
+        ProgressStyle::with_template(
+            "{prefix:<22} [{bar:30.cyan/blue}] {human_pos:>13}/{human_len:<13} {msg}",
+        )
+        .unwrap()
+        .progress_chars("##-")
+    }
+
+    fn install_bar(&mut self, name: &str, total: u64) -> usize {
+        let bar = self.multi.add(ProgressBar::new(total));
+        bar.set_style(Self::phase_style());
+        bar.set_prefix(name.to_string());
+        self.bars.push(bar);
+        let idx = self.bars.len() - 1;
+        self.name_to_idx.insert(name.to_string(), idx);
+        idx
     }
 }
 
 impl ProgressReporter for CliProgress {
+    fn set_phases(&mut self, phases: &[Phase]) {
+        for p in phases {
+            let idx = self.install_bar(p.name, p.total);
+            let bar = &self.bars[idx];
+            bar.set_message("(pending)");
+            // Force an initial draw so all phases are visible before the
+            // first one starts ticking.
+            bar.tick();
+        }
+    }
+
     fn start_phase(&mut self, name: &str, total: u64) {
-        let bar = ProgressBar::new(total);
-        bar.set_style(
-            ProgressStyle::with_template(
-                "{prefix:>20} [{bar:30.cyan/blue}] {pos}/{len} ({eta})",
-            )
-            .unwrap()
-            .progress_chars("##-"),
-        );
-        bar.set_prefix(name.to_string());
-        self.tick_every = (total / 100).max(1);
+        let idx = match self.name_to_idx.get(name).copied() {
+            Some(i) => i,
+            None => self.install_bar(name, total),
+        };
+        let bar = &self.bars[idx];
+        bar.set_length(total);
+        bar.set_message("");
+        bar.set_position(0);
+        self.current = Some(idx);
         self.counter = 0;
-        self.bar = Some(bar);
+        self.tick_every = (total / 100).max(1);
     }
 
     fn tick(&mut self) {
-        self.counter += 1;
-        if let Some(bar) = self.bar.as_ref() {
+        if let Some(idx) = self.current {
+            self.counter += 1;
             if self.counter.is_multiple_of(self.tick_every) {
-                bar.set_position(self.counter);
+                self.bars[idx].set_position(self.counter);
             }
         }
     }
 
     fn end_phase(&mut self) {
-        if let Some(bar) = self.bar.take() {
-            bar.set_position(self.counter);
-            bar.finish_and_clear();
+        if let Some(idx) = self.current.take() {
+            let bar = &self.bars[idx];
+            let total = bar.length().unwrap_or(self.counter);
+            bar.set_position(total);
+            bar.finish_with_message("done");
         }
     }
 }
