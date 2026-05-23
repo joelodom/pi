@@ -68,9 +68,11 @@ Run `./target/release/pi --help` for the full flag list.
   `--from-decimal` is required and converts the decimal pi file to hex
   on disk (atomic `.tmp` + rename).  BBP-spot-checks the hex file in
   **four parallel phases**, each with its own progress bar: the three
-  sanity regions (first / middle / last 1M hex digits, deterministic)
-  and an unbounded random-sampling loop (window starts via `OsRng`, 8
-  hex digits per BBP call).  All four share a rayon thread pool; as
+  sanity regions (first 1M / middle 100K / last 10K hex digits,
+  deterministic, with sample counts scaled 100 / 10 / 1 since each
+  BBP call deeper in the file is much more expensive) and an
+  unbounded random-sampling loop (window starts via `OsRng`, 8 hex
+  digits per BBP call).  All four share a rayon thread pool; as
   sanity phases finish, their CPU naturally redistributes to remaining
   phases via work-stealing.  Runs until SIGINT or a mismatch; SIGINT
   exits within milliseconds (BBP polls a stop flag every ~10K inner
@@ -86,8 +88,8 @@ Run `./target/release/pi --help` for the full flag list.
 | `--verify FILE_A FILE_B` | | Byte-by-byte compare two digit files, ignoring trailing whitespace. Runs instead of compute. |
 | `--verify-hex HEX_FILE` | | BBP-based hex verification. Runs instead of compute. |
 | `--from-decimal DEC_FILE` | | With `--verify-hex`, source decimal file to convert when `HEX_FILE` doesn't yet exist. |
-| `--samples-per-window M` | `100` | With `--verify-hex`, BBP samples per random-window (each call covers 8 hex digits). |
-| `--sanity-samples N` | `100` | With `--verify-hex`, BBP samples per sanity region (first/middle/last 1M). |
+| `--samples-per-window M` | `10` | With `--verify-hex`, BBP samples per random-window (each call covers 8 hex digits). |
+| `--sanity-samples N` | `100` | With `--verify-hex`, BBP samples in the *first* sanity region (1M-digit window). The middle (100K-digit window) and last (10K-digit window) regions get `N/10` and `N/100` respectively (each ≥ 1), since per-BBP-call cost grows with absolute file position. |
 | `--max-jobs J` | ncpu | With `--verify-hex`, maximum rayon worker threads (shared across all parallel verification phases). |
 
 Running `pi` with no arguments prints the help text.

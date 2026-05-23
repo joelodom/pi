@@ -75,7 +75,15 @@ pub fn run(
     } else {
         Some(ConversionBars::create(&multi))
     };
-    let sanity = SanityBars::create(&multi, sanity_samples as u64);
+    // Per-region sample counts scale with the region width so the
+    // narrower (and deeper, more expensive) middle/last regions don't
+    // take orders of magnitude longer than the first one.  `--sanity-samples`
+    // is the *first*-region count; middle/last get 1/10 and 1/100,
+    // with a floor of 1 so every region produces at least one check.
+    let first_samples = sanity_samples as u64;
+    let middle_samples = ((sanity_samples / 10) as u64).max(1);
+    let last_samples = ((sanity_samples / 100) as u64).max(1);
+    let sanity = SanityBars::create(&multi, first_samples, middle_samples, last_samples);
     let random = PhaseBar::new_spinner(&multi, "random sampling");
 
     // ---------------------------------------------------------------------
@@ -137,13 +145,13 @@ pub fn run(
     });
 
     // ---------------------------------------------------------------------
-    // Build the three sanity ranges and launch all four phases in
-    // parallel via `pool.scope`.
+    // Build the three sanity ranges (widths RANGE_FIRST/MIDDLE/LAST) and
+    // launch all four phases in parallel via `pool.scope`.
     // ---------------------------------------------------------------------
-    let range_first = 0..1_000_000_u64.min(n_hex_digits);
+    let range_first = 0..RANGE_FIRST.min(n_hex_digits);
     let half = n_hex_digits / 2;
-    let range_middle = half..(half + 1_000_000).min(n_hex_digits);
-    let range_last = n_hex_digits.saturating_sub(1_000_000)..n_hex_digits;
+    let range_middle = half..(half + RANGE_MIDDLE).min(n_hex_digits);
+    let range_last = n_hex_digits.saturating_sub(RANGE_LAST)..n_hex_digits;
 
     let file_ref = &file;
     let stop_ref: &AtomicBool = &stop;
@@ -159,7 +167,7 @@ pub fn run(
                 file_ref,
                 data_offset,
                 range_first,
-                sanity_samples,
+                first_samples as usize,
                 first_bar,
                 stop_ref,
                 error_slot_ref,
@@ -170,7 +178,7 @@ pub fn run(
                 file_ref,
                 data_offset,
                 range_middle,
-                sanity_samples,
+                middle_samples as usize,
                 middle_bar,
                 stop_ref,
                 error_slot_ref,
@@ -181,7 +189,7 @@ pub fn run(
                 file_ref,
                 data_offset,
                 range_last,
-                sanity_samples,
+                last_samples as usize,
                 last_bar,
                 stop_ref,
                 error_slot_ref,
@@ -373,14 +381,24 @@ struct SanityBars {
 }
 
 impl SanityBars {
-    fn create(multi: &MultiProgress, samples_per_region: u64) -> Self {
+    fn create(multi: &MultiProgress, first: u64, middle: u64, last: u64) -> Self {
         Self {
-            first: PhaseBar::new_finite(multi, "sanity: first 1M", samples_per_region),
-            middle: PhaseBar::new_finite(multi, "sanity: middle 1M", samples_per_region),
-            last: PhaseBar::new_finite(multi, "sanity: last 1M", samples_per_region),
+            first: PhaseBar::new_finite(multi, "sanity: first 1M", first),
+            middle: PhaseBar::new_finite(multi, "sanity: middle 100K", middle),
+            last: PhaseBar::new_finite(multi, "sanity: last 10K", last),
         }
     }
 }
+
+/// Per-region range widths.  The first region casts a wide net across
+/// the easy/cheap end of the file; the middle and last regions cover
+/// progressively narrower windows where each BBP call is much more
+/// expensive (cost scales with absolute file position).  Sample counts
+/// are scaled in the same ratio so the slow regions don't dominate
+/// total sanity wall time.
+const RANGE_FIRST: u64 = 1_000_000;
+const RANGE_MIDDLE: u64 = 100_000;
+const RANGE_LAST: u64 = 10_000;
 
 // =========================================================================
 // Conversion (decimal -> hex)

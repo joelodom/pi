@@ -73,7 +73,7 @@ struct Cli {
 
     /// `--verify-hex`: BBP samples per random window (each BBP call
     /// verifies 8 consecutive hex digits).
-    #[arg(long, default_value_t = 100, value_name = "M", requires = "verify_hex")]
+    #[arg(long, default_value_t = 10, value_name = "M", requires = "verify_hex")]
     samples_per_window: usize,
 
     /// `--verify-hex`: BBP samples per sanity region (first/middle/last 1M).
