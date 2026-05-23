@@ -3,10 +3,15 @@
 A CLI program in Rust for computing pi to arbitrary precision, designed
 to start at a million digits and scale upward.
 
-The current implementation uses the **Chudnovsky algorithm with binary
-splitting**, evaluated with GMP/MPFR via the
-[`rug`](https://crates.io/crates/rug) crate. A million digits finishes
-in a few seconds on a modern laptop.
+Two algorithms are implemented:
+
+* **Chudnovsky** with binary splitting (default; fastest in practice).
+* **Gauss-Legendre / Brent-Salamin** AGM iteration (independent
+  cross-check algorithm).
+
+Both run on GMP/MPFR via the [`rug`](https://crates.io/crates/rug)
+crate. A million digits finishes in well under a second on a modern
+laptop with either algorithm.
 
 ## Quickstart
 
@@ -51,7 +56,7 @@ Run `./target/release/pi --help` for the full flag list.
 |------|---------|-------------|
 | `-d, --digits N` | `1000000` | Decimal digits to compute (counting the leading `3`). |
 | `-o, --output FILE` | `-` | File to write digits to. Use `-` for stdout. |
-| `--algorithm NAME` | `chudnovsky` | Algorithm to use. Currently only `chudnovsky` is available. |
+| `--algorithm NAME` | `chudnovsky` | `chudnovsky` (series + binary splitting) or `gauss-legendre` (AGM iteration). |
 | `--no-progress` | | Suppress the progress bar (it goes to stderr). |
 | `--verify FILE_A FILE_B` | | Byte-by-byte compare two digit files, ignoring trailing whitespace. Runs instead of compute. |
 
@@ -141,7 +146,31 @@ number of series terms for a given target digit count. Each algorithm
 declares its `digits_per_term`; the planner uses that to choose the term
 count, then adds a fixed safety margin in both terms and bits.
 
+## Cross-algorithm verification
+
+The two algorithms share only the bignum backend, the precision plan,
+and the decimal-conversion code; the actual pi computation goes through
+two entirely independent code paths (series + binary splitting vs.
+quadratically-convergent AGM iteration with sqrt). Any bug specific to
+one of them — wrong formula constants, an off-by-one in the
+binary-splitting recurrence, a wrong initial condition in the AGM — is
+caught by a byte-by-byte match on `D` digits between the two
+algorithms.
+
+To cross-check a D-digit computation:
+
+```sh
+./target/release/pi --digits 1000000000 -o pi-chud.txt
+./target/release/pi --digits 1000000000 --algorithm gauss-legendre -o pi-gl.txt
+./target/release/pi --verify pi-chud.txt pi-gl.txt
+```
+
+Gauss-Legendre is roughly 2–3× slower than Chudnovsky in practice, so
+the cross-check costs roughly the time of one Chudnovsky run again.
+
 ## Algorithm details
+
+### Chudnovsky
 
 Chudnovsky brothers' formula:
 
@@ -175,6 +204,26 @@ Working precision is `D · log2(10) + 256` bits, and we compute
 `D / 14.18 + 8` terms. The 256-bit and 8-term margins are generous; only
 the final scaled `pi × 10^(D-1)` multiplication and a handful of GMP
 roundings consume any of them.
+
+### Gauss-Legendre / Brent-Salamin
+
+```text
+a₀ = 1     b₀ = 1/√2     t₀ = 1/4     p₀ = 1
+
+aₙ₊₁ = (aₙ + bₙ) / 2
+bₙ₊₁ = √(aₙ · bₙ)
+tₙ₊₁ = tₙ − pₙ · (aₙ − aₙ₊₁)²
+pₙ₊₁ = 2 · pₙ
+
+π  ≈  (aₙ + bₙ)² / (4 tₙ)
+```
+
+Quadratic convergence: the number of correct binary digits roughly
+doubles per iteration, so reaching `P` bits needs ≈ ⌈log₂ P⌉
+iterations (we add a small safety margin, currently 2).
+
+The implementation lives in `crates/pi-core/src/algorithm/gauss_legendre.rs`.
+It is provided primarily as an *independent* cross-check for Chudnovsky.
 
 ## Roadmap to one trillion digits
 

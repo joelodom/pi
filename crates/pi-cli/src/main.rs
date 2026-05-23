@@ -58,12 +58,15 @@ struct Cli {
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum AlgorithmFlag {
     Chudnovsky,
+    #[value(name = "gauss-legendre")]
+    GaussLegendre,
 }
 
 impl From<AlgorithmFlag> for AlgorithmKind {
     fn from(f: AlgorithmFlag) -> Self {
         match f {
             AlgorithmFlag::Chudnovsky => AlgorithmKind::Chudnovsky,
+            AlgorithmFlag::GaussLegendre => AlgorithmKind::GaussLegendre,
         }
     }
 }

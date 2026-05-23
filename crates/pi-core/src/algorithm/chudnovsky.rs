@@ -32,19 +32,24 @@
 //! the top of the recursion, so the dominant cost is a single GMP
 //! multiplication of two `D`-digit numbers — O(M(D) · log D) total.
 
-use anyhow::{anyhow, bail, Result};
-use rug::float::Round;
-use rug::ops::{Pow, PowAssign};
+use anyhow::Result;
+use rug::ops::Pow;
 use rug::{Float, Integer};
 
 use crate::output::DigitSink;
 use crate::precision::PrecisionPlan;
 use crate::progress::{Phase, ProgressReporter};
 
+use super::util::{widen_mpfr_exponent_range_for, write_decimal_digits};
 use super::PiAlgorithm;
 
 /// Decimal digits added per Chudnovsky term (≈ log10(C³ / 24) / 3).
 pub const DIGITS_PER_TERM: f64 = 14.181_647_462_725_478;
+
+/// Extra series terms beyond the asymptotic estimate, to absorb the
+/// discrete rounding when converting from a per-term digit count to an
+/// integer count.
+const SAFETY_TERMS: u64 = 8;
 
 const A: u32 = 13_591_409;
 const B: u32 = 545_140_134;
@@ -52,16 +57,16 @@ const B: u32 = 545_140_134;
 // constant.
 const C3_OVER_24: u64 = 10_939_058_860_032_000;
 
+const PHASE_BINARY_SPLITTING: &str = "binary splitting";
+const PHASE_FINAL_ASSEMBLY: &str = "final assembly";
+const PHASE_DECIMAL_CONVERSION: &str = "decimal conversion";
+
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Chudnovsky;
 
 impl PiAlgorithm for Chudnovsky {
     fn name(&self) -> &'static str {
         "chudnovsky"
-    }
-
-    fn digits_per_term(&self) -> f64 {
-        DIGITS_PER_TERM
     }
 
     fn compute(
@@ -75,26 +80,22 @@ impl PiAlgorithm for Chudnovsky {
             return Ok(());
         }
 
-        let plan = PrecisionPlan::for_digits(digits, DIGITS_PER_TERM)?;
-
-        // Widen MPFR's allowed exponent range.  At D digits, the
-        // `pi *= &q` step temporarily has magnitude ~10^D — for a
-        // billion digits that's exponent ~3.3·10^9 binary, well past
-        // MPFR's default emax (2^30 - 1) and would otherwise overflow to
-        // +∞ silently.  This is a process-global change, but widening
-        // the range is harmless for Floats with small magnitudes.
+        let plan = PrecisionPlan::for_digits(digits)?;
         widen_mpfr_exponent_range_for(digits)?;
 
-        // Declare the upcoming phases up front so reporters can show the
-        // full pipeline (including what's still pending).
+        // Number of binary-splitting terms.  Each Chudnovsky term
+        // contributes `DIGITS_PER_TERM` digits; round up and add a
+        // small safety margin for the discrete-to-continuous gap.
+        let n_terms = (digits as f64 / DIGITS_PER_TERM).ceil() as u64 + SAFETY_TERMS;
+
         progress.set_phases(&[
-            Phase { name: PHASE_BINARY_SPLITTING, total: plan.terms },
+            Phase { name: PHASE_BINARY_SPLITTING, total: n_terms },
             Phase { name: PHASE_FINAL_ASSEMBLY, total: 4 },
             Phase { name: PHASE_DECIMAL_CONVERSION, total: 1 },
         ]);
 
-        progress.start_phase(PHASE_BINARY_SPLITTING, plan.terms);
-        let (_p, q, t) = binary_split(1, plan.terms + 1, progress);
+        progress.start_phase(PHASE_BINARY_SPLITTING, n_terms);
+        let (_p, q, t) = binary_split(1, n_terms + 1, progress);
         progress.end_phase();
 
         progress.start_phase(PHASE_FINAL_ASSEMBLY, 4);
@@ -122,47 +123,6 @@ impl PiAlgorithm for Chudnovsky {
 
         Ok(())
     }
-}
-
-const PHASE_BINARY_SPLITTING: &str = "binary splitting";
-const PHASE_FINAL_ASSEMBLY: &str = "final assembly";
-const PHASE_DECIMAL_CONVERSION: &str = "decimal conversion";
-
-/// Push MPFR's allowed exponent range out to its hardware maximum so the
-/// O(10^D)-magnitude intermediates during binary splitting don't trigger
-/// silent overflow to +∞.  The change is process-global, but a widened
-/// range is harmless for any Float with a small magnitude.
-fn widen_mpfr_exponent_range_for(digits: u64) -> Result<()> {
-    use gmp_mpfr_sys::mpfr;
-    use std::f64::consts::LOG2_10;
-
-    // Conservative estimate of the largest binary exponent we'll need:
-    // log2(10) · D, plus generous margin for the inner multiplications
-    // (each `pi *= ...` can grow the exponent).
-    let needed_exp = (digits as f64 * LOG2_10).ceil() as i128 + 1024;
-
-    // Safety: every gmp_mpfr_sys call here only reads or writes MPFR's
-    // global emin/emax thread-local state through the documented MPFR
-    // API.  None of them dereferences any pointer we hand in.
-    unsafe {
-        let emax_max = mpfr::get_emax_max();
-        let emin_min = mpfr::get_emin_min();
-        if needed_exp > emax_max as i128 {
-            bail!(
-                "{} digits requires an MPFR exponent up to {}, exceeding the platform cap ({})",
-                digits,
-                needed_exp,
-                emax_max
-            );
-        }
-        if mpfr::set_emax(emax_max) != 0 {
-            bail!("failed to widen MPFR emax to {}", emax_max);
-        }
-        if mpfr::set_emin(emin_min) != 0 {
-            bail!("failed to widen MPFR emin to {}", emin_min);
-        }
-    }
-    Ok(())
 }
 
 /// Binary splitting over the half-open range `[a, b)` of Chudnovsky terms.
@@ -209,87 +169,11 @@ fn binary_split(
     }
 }
 
-/// Render `pi` to `digits` decimal digits and stream them to `sink`.
-fn write_decimal_digits(pi: &Float, digits: u64, sink: &mut dyn DigitSink) -> Result<()> {
-    // Multiply by 10^(digits - 1) so the truncated value is an integer with
-    // exactly `digits` decimal digits.  The working precision (see
-    // `PrecisionPlan`) is wide enough to represent 10^(digits - 1) exactly,
-    // so the multiplication is lossless to many more bits than we need.
-    let prec = pi.prec_64();
-    let exp = Integer::from(digits) - 1_u32;
-    let mut scale = Float::with_val_64(prec, 10);
-    scale.pow_assign(&exp);
-    let scaled = Float::with_val_64(prec, pi * &scale);
-
-    // Truncate (round toward -∞ — for positive pi the same as floor and
-    // the same as `trunc`).  `Float::to_integer` rounds to nearest, which
-    // would give the wrong answer for "the first N digits of pi" whenever
-    // the digit just past the cut is ≥ 5.
-    let (int_part, _ord) = scaled
-        .to_integer_round(Round::Down)
-        .ok_or_else(|| anyhow!("pi scaled to integer was non-finite"))?;
-
-    let mut s = int_part.to_string();
-    let want = digits as usize;
-    match s.len().cmp(&want) {
-        std::cmp::Ordering::Less => {
-            // Should not happen for pi (always starts with "3"), but pad
-            // defensively to keep the contract clear for future algorithms.
-            let pad = want - s.len();
-            s = "0".repeat(pad) + &s;
-        }
-        std::cmp::Ordering::Greater => s.truncate(want),
-        std::cmp::Ordering::Equal => {}
-    }
-
-    sink.write_integer_part(&s[..1])?;
-    if digits > 1 {
-        sink.write_fractional_digits(&s[1..])?;
-    }
-    sink.finish()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::DigitSink;
+    use super::super::util::test_support::{StringSink, FIRST_100};
     use crate::progress::NoopProgress;
-    use std::io;
-
-    struct StringSink {
-        out: String,
-        wrote_dot: bool,
-    }
-
-    impl StringSink {
-        fn new() -> Self {
-            Self { out: String::new(), wrote_dot: false }
-        }
-    }
-
-    impl DigitSink for StringSink {
-        fn write_integer_part(&mut self, digits: &str) -> io::Result<()> {
-            self.out.push_str(digits);
-            Ok(())
-        }
-        fn write_fractional_digits(&mut self, digits: &str) -> io::Result<()> {
-            if !self.wrote_dot {
-                self.out.push('.');
-                self.wrote_dot = true;
-            }
-            self.out.push_str(digits);
-            Ok(())
-        }
-        fn finish(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    // First 100 digits of pi, counting the leading `3` (so 99 fractional
-    // digits, ending at the `7` that comes before the `9` at fractional
-    // position 100).
-    const FIRST_100: &str = "3.141592653589793238462643383279502884197169399375105820974944592307816406286208998628034825342117067";
 
     #[test]
     fn one_digit() {
