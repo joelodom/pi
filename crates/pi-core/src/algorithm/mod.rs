@@ -1,7 +1,12 @@
 //! Algorithm trait and registry.
 //!
-//! New algorithms (Gauss-Legendre, BBP, Borwein, ...) implement
-//! [`PiAlgorithm`] and add a variant to [`AlgorithmKind`].
+//! Currently registered: Chudnovsky (with binary splitting) and
+//! Gauss-Legendre (Brent-Salamin AGM).  Future algorithms (Borwein
+//! quintic, an NTT-backed Chudnovsky, …) implement [`PiAlgorithm`]
+//! and add a variant to [`AlgorithmKind`].
+//!
+//! BBP is *not* in this registry — it cannot produce decimal digits
+//! efficiently; it lives in [`crate::bbp`] as a verification oracle.
 
 use std::fmt;
 
@@ -15,13 +20,20 @@ pub mod gauss_legendre;
 mod util;
 
 /// Strategy for computing pi to a chosen number of decimal digits.
+///
+/// Implementations are responsible for picking their own series-vs-
+/// iteration term count from a [`crate::precision::PrecisionPlan`].
+/// The plan only computes working precision; nothing in the plan or
+/// the trait is algorithm-specific.
 pub trait PiAlgorithm {
     /// Stable identifier used in flags and logs.
     fn name(&self) -> &'static str;
 
     /// Compute `digits` decimal digits of pi (counting the leading `3`),
     /// streaming the result through `sink` and reporting progress to
-    /// `progress`.
+    /// `progress`.  Implementations should call
+    /// [`ProgressReporter::set_phases`] once at the start with their
+    /// full phase list so multi-phase backends can render upcoming work.
     fn compute(
         &self,
         digits: u64,

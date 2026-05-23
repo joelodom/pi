@@ -3,15 +3,21 @@
 A CLI program in Rust for computing pi to arbitrary precision, designed
 to start at a million digits and scale upward.
 
-Two algorithms are implemented:
+Two compute algorithms plus three verification paths:
 
 * **Chudnovsky** with binary splitting (default; fastest in practice).
 * **Gauss-Legendre / Brent-Salamin** AGM iteration (independent
   cross-check algorithm).
+* **`--verify FILE_A FILE_B`** — byte-by-byte compare of two digit
+  files, ignoring trailing whitespace.
+* **`--verify-hex HEX_FILE [--from-decimal DEC_FILE]`** — convert a
+  decimal pi file to hex once and then spot-check thousands of
+  cryptographically-randomly-chosen hex positions against the
+  Bailey-Borwein-Plouffe (BBP) formula as an independent oracle.
 
-Both run on GMP/MPFR via the [`rug`](https://crates.io/crates/rug)
-crate. A million digits finishes in well under a second on a modern
-laptop with either algorithm.
+Compute and BBP arithmetic both run on GMP/MPFR via the
+[`rug`](https://crates.io/crates/rug) crate. A million digits
+finishes in well under a second with either compute algorithm.
 
 ## Quickstart
 
@@ -31,7 +37,13 @@ cargo build --release
 # against the matching prefix of the longer one — so a freshly computed
 # 1M-digit pi.txt will succeed against a 100M-digit reference if it agrees
 # on the first 1M digits.
-./target/release/pi --verify pi.txt pi3-100-million.txt
+./target/release/pi --verify pi.txt pi3-100-million-verified.txt
+
+# Independent BBP-based verification.  First time, convert the decimal
+# file to hex on disk; subsequent times, reuse it.  Runs until Ctrl-C
+# or a mismatch.
+./target/release/pi --verify-hex pi-hex.txt --from-decimal pi.txt
+./target/release/pi --verify-hex pi-hex.txt   # reuse the existing hex file
 
 # Compute 100 digits to stdout.
 ./target/release/pi --digits 100
@@ -41,24 +53,38 @@ Run `./target/release/pi --help` for the full flag list.
 
 ## CLI
 
-`pi` has two modes, picked by which flags are given:
+`pi` has three modes, picked by which flags are given:
 
 * **Compute** — `pi --digits N [-o FILE] [--algorithm ALG] [--no-progress]`.
   After writing to a file, the CLI prints the suggested `pi --verify ...`
   invocation.
-* **Verify** — `pi --verify FILE_A FILE_B`.  Trims trailing whitespace
-  (`' '`, `'\t'`, `'\n'`, `'\r'`) from both files, then byte-by-byte
-  compares the shorter content against the matching prefix of the longer
-  content.  On mismatch it reports the first differing byte offset and
-  exits non-zero.  Skips computation entirely.
+* **Verify (file vs. file)** — `pi --verify FILE_A FILE_B`.  Trims trailing
+  whitespace (`' '`, `'\t'`, `'\n'`, `'\r'`) from both files, then
+  byte-by-byte compares the shorter content against the matching prefix
+  of the longer content.  On mismatch it reports the first differing
+  byte offset and exits non-zero.  Skips computation entirely.
+* **Verify-hex (BBP spot-check)** — `pi --verify-hex HEX_FILE
+  [--from-decimal DEC_FILE]`.  If `HEX_FILE` exists, reuses it; otherwise
+  `--from-decimal` is required and converts the decimal pi file to hex
+  on disk (atomic `.tmp` + rename).  Then BBP-spot-checks the hex file
+  in two phases: a deterministic sanity sweep over the first / middle /
+  last 1M hex digits, followed by an unbounded random-sampling loop
+  (window starts via `OsRng`, 8 hex digits per BBP call, parallel via
+  rayon).  Runs until SIGINT or a mismatch; on mismatch reports the
+  position and the offending byte and exits non-zero.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-d, --digits N` | `1000000` | Decimal digits to compute (counting the leading `3`). |
 | `-o, --output FILE` | `-` | File to write digits to. Use `-` for stdout. |
 | `--algorithm NAME` | `chudnovsky` | `chudnovsky` (series + binary splitting) or `gauss-legendre` (AGM iteration). |
-| `--no-progress` | | Suppress the progress bar (it goes to stderr). |
+| `--no-progress` | | Suppress the progress bars (they go to stderr). |
 | `--verify FILE_A FILE_B` | | Byte-by-byte compare two digit files, ignoring trailing whitespace. Runs instead of compute. |
+| `--verify-hex HEX_FILE` | | BBP-based hex verification. Runs instead of compute. |
+| `--from-decimal DEC_FILE` | | With `--verify-hex`, source decimal file to convert when `HEX_FILE` doesn't yet exist. |
+| `--samples-per-window M` | `100` | With `--verify-hex`, BBP samples per random-window (each call covers 8 hex digits). |
+| `--sanity-samples N` | `100` | With `--verify-hex`, BBP samples per sanity region (first/middle/last 1M). |
+| `--jobs J` | ncpu | With `--verify-hex`, rayon worker threads. |
 
 Running `pi` with no arguments prints the help text.
 
@@ -68,17 +94,22 @@ Running `pi` with no arguments prints the help text.
 pi/
 ├── Cargo.toml              # Workspace
 └── crates/
-    ├── pi-core/            # Library: algorithms, sinks, planning, progress
+    ├── pi-core/            # Library: algorithms, sinks, planning, progress, BBP
     │   └── src/
     │       ├── lib.rs
     │       ├── algorithm/
-    │       │   ├── mod.rs       # PiAlgorithm trait + registry
-    │       │   └── chudnovsky.rs
-    │       ├── output.rs        # DigitSink trait + WriterSink
-    │       ├── precision.rs     # PrecisionPlan
-    │       └── progress.rs      # ProgressReporter trait + NoopProgress
+    │       │   ├── mod.rs            # PiAlgorithm trait + registry
+    │       │   ├── chudnovsky.rs
+    │       │   ├── gauss_legendre.rs
+    │       │   └── util.rs           # widen_mpfr_exponent_range, write_decimal_digits
+    │       ├── bbp.rs                # Bailey-Borwein-Plouffe hex digit extractor
+    │       ├── output.rs             # DigitSink trait + WriterSink
+    │       ├── precision.rs          # PrecisionPlan
+    │       └── progress.rs           # ProgressReporter trait + Phase + NoopProgress
     └── pi-cli/             # Binary `pi`
-        └── src/main.rs
+        └── src/
+            ├── main.rs               # CLI, compute mode, --verify mode
+            └── verify_hex.rs         # --verify-hex orchestration
 ```
 
 ## Architecture
@@ -92,7 +123,6 @@ progress backend does not touch the others.
 ```rust
 pub trait PiAlgorithm {
     fn name(&self) -> &'static str;
-    fn digits_per_term(&self) -> f64;
     fn compute(
         &self,
         digits: u64,
@@ -102,9 +132,10 @@ pub trait PiAlgorithm {
 }
 ```
 
-To add a new algorithm (Gauss-Legendre, BBP, Borwein quintic, …) implement
-this trait and add a variant to `AlgorithmKind`. Nothing in the CLI or the
-sinks changes.
+To add a new algorithm (Borwein quintic, an NTT-backed Chudnovsky, …)
+implement this trait and add a variant to `AlgorithmKind`. Term/iteration
+counts are algorithm-private; the shared `PrecisionPlan` only computes
+the working precision. Nothing in the CLI or the sinks changes.
 
 ### `DigitSink` (`crates/pi-core/src/output.rs`)
 
@@ -129,35 +160,65 @@ Two ready-to-use shapes are provided: `stdout_sink()` and
 
 ```rust
 pub trait ProgressReporter {
+    fn set_phases(&mut self, _phases: &[Phase]) {}
     fn start_phase(&mut self, name: &str, total: u64);
     fn tick(&mut self);
     fn end_phase(&mut self);
 }
+
+pub struct Phase { pub name: &'static str, pub total: u64 }
 ```
 
-The CLI implements an `indicatif`-backed reporter; tests use `NoopProgress`.
-Any other backend (structured logging, telemetry, web socket) plugs in the
-same way.
+Algorithms call `set_phases` up front with the full ordered list of
+phases they intend to run, so a multi-phase reporter (like the CLI's
+`MultiProgress`-backed one) can render pending / running / completed
+bars at a glance. Tests use `NoopProgress`. Any other backend
+(structured logging, telemetry, web socket) plugs in the same way.
 
 ### `PrecisionPlan` (`crates/pi-core/src/precision.rs`)
 
-Decides the working precision (mantissa bits for `rug::Float`) and the
-number of series terms for a given target digit count. Each algorithm
-declares its `digits_per_term`; the planner uses that to choose the term
-count, then adds a fixed safety margin in both terms and bits.
+Decides the working precision (mantissa bits for `rug::Float`) for a
+given target digit count, with a `u64` precision field, a fixed 256-bit
+safety margin, and explicit `bail!`s when the request would push the
+f64-based planning arithmetic or MPFR's `prec_max_64()` past their
+limits. Series-vs-iteration term counts are algorithm-specific and
+live inside each algorithm module rather than in `PrecisionPlan`.
 
-## Cross-algorithm verification
+### `bbp` (`crates/pi-core/src/bbp.rs`)
 
-The two algorithms share only the bignum backend, the precision plan,
-and the decimal-conversion code; the actual pi computation goes through
-two entirely independent code paths (series + binary splitting vs.
-quadratically-convergent AGM iteration with sqrt). Any bug specific to
-one of them — wrong formula constants, an off-by-one in the
-binary-splitting recurrence, a wrong initial condition in the AGM — is
-caught by a byte-by-byte match on `D` digits between the two
-algorithms.
+Pure-Rust Bailey-Borwein-Plouffe hex digit extractor: `hex_digits_at(n)`
+returns the 8 hex digits of pi's fractional expansion starting at
+position `n`, packed in a `u32`. Uses `u64` fixed-point arithmetic in
+the running sum and `u128` modular exponentiation in the inner loop —
+no `rug` dependency. Cost per call is O(n log n) machine ops. Reliable
+for `n` up to ~10^9 (the top ~30 bits of the accumulated sum remain
+correct).
 
-To cross-check a D-digit computation:
+## Verification
+
+Three independent checks; any combination of them gives high confidence:
+
+**1. Compare against a trusted reference file.**
+
+```sh
+./target/release/pi --verify pi.txt pi3-100-million-verified.txt
+```
+
+Trims trailing whitespace on both sides. The shorter file's content
+must match the matching prefix of the longer one, so a freshly
+computed N-digit `pi.txt` succeeds against a much larger reference
+when its first N digits agree.
+
+**2. Cross-algorithm: Chudnovsky vs. Gauss-Legendre.**
+
+The two compute algorithms share only the bignum backend, the
+precision plan, and the decimal-conversion code; the actual pi
+computation goes through two entirely independent code paths (series
++ binary splitting vs. quadratically-convergent AGM iteration with
+sqrt). Any bug specific to one of them — wrong formula constants, an
+off-by-one in the binary-splitting recurrence, a wrong initial
+condition in the AGM — is caught by a byte-by-byte match on `D`
+digits between the two algorithms.
 
 ```sh
 ./target/release/pi --digits 1000000000 -o pi-chud.txt
@@ -167,6 +228,27 @@ To cross-check a D-digit computation:
 
 Gauss-Legendre is roughly 2–3× slower than Chudnovsky in practice, so
 the cross-check costs roughly the time of one Chudnovsky run again.
+
+**3. BBP spot-checks (`--verify-hex`).**
+
+A third independent path that uses a completely different formula
+(Bailey-Borwein-Plouffe) and produces hex digits, not decimal. Run
+once to convert your decimal pi file to hex on disk, then sample
+cryptographically-randomly-chosen positions until you're satisfied or
+a mismatch is detected:
+
+```sh
+# First run: convert + verify (the conversion is cached on disk).
+./target/release/pi --verify-hex pi-hex.txt --from-decimal pi.txt
+
+# Subsequent runs reuse the converted file:
+./target/release/pi --verify-hex pi-hex.txt
+```
+
+The conversion step is the long pole (10–30 min for a billion-digit
+input); each subsequent run does only spot-checks and starts sampling
+in seconds. The random phase runs until SIGINT or a mismatch, so let
+it run as long as you want.
 
 ## Algorithm details
 
@@ -224,6 +306,22 @@ iterations (we add a small safety margin, currently 2).
 
 The implementation lives in `crates/pi-core/src/algorithm/gauss_legendre.rs`.
 It is provided primarily as an *independent* cross-check for Chudnovsky.
+
+### BBP (verification only)
+
+```text
+π  =  Σ_{k=0}^∞ (1/16^k) [ 4/(8k+1) − 2/(8k+4) − 1/(8k+5) − 1/(8k+6) ]
+```
+
+For position `n`, multiply through by `16^n` and take the fractional
+part. The sum splits at `k = n`: the `k ≤ n` half is computed with
+modular exponentiation on small (`8k+r`) denominators (so each term
+fits in a `u64`); the `k > n` tail decays by `1/16` per step and is
+summed in `f64`. The accumulated fractional sum lives in a `u64`
+fixed-point register (representing `v / 2^64`); the top 32 bits of
+that register are the 8 hex digits we report. Implementation in
+`crates/pi-core/src/bbp.rs`. Used by `--verify-hex`; never used to
+produce digits.
 
 ## Roadmap to one trillion digits
 
