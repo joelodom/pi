@@ -75,7 +75,7 @@ impl PiAlgorithm for Chudnovsky {
             return Ok(());
         }
 
-        let plan = PrecisionPlan::for_digits(digits, DIGITS_PER_TERM);
+        let plan = PrecisionPlan::for_digits(digits, DIGITS_PER_TERM)?;
 
         progress.start_phase("binary splitting", plan.terms);
         let (_p, q, t) = binary_split(1, plan.terms + 1, progress);
@@ -87,7 +87,7 @@ impl PiAlgorithm for Chudnovsky {
         let denom_int = Integer::from(A) * &q + &t;
         progress.tick();
 
-        let mut pi = Float::with_val(plan.precision_bits, 10_005);
+        let mut pi = Float::with_val_64(plan.precision_bits, 10_005);
         pi.sqrt_mut();
         progress.tick();
 
@@ -120,6 +120,7 @@ fn binary_split(
     b: u64,
     progress: &mut dyn ProgressReporter,
 ) -> (Integer, Integer, Integer) {
+    debug_assert!(a < b, "binary_split called with empty/reversed range [{a}, {b})");
     if b - a == 1 {
         let k = Integer::from(a);
         let six_k = Integer::from(&k * 6_u32);
@@ -157,11 +158,11 @@ fn write_decimal_digits(pi: &Float, digits: u64, sink: &mut dyn DigitSink) -> Re
     // exactly `digits` decimal digits.  The working precision (see
     // `PrecisionPlan`) is wide enough to represent 10^(digits - 1) exactly,
     // so the multiplication is lossless to many more bits than we need.
-    let prec = pi.prec();
+    let prec = pi.prec_64();
     let exp = Integer::from(digits) - 1_u32;
-    let mut scale = Float::with_val(prec, 10);
+    let mut scale = Float::with_val_64(prec, 10);
     scale.pow_assign(&exp);
-    let scaled = Float::with_val(prec, pi * &scale);
+    let scaled = Float::with_val_64(prec, pi * &scale);
 
     // Truncate (round toward -∞ — for positive pi the same as floor and
     // the same as `trunc`).  `Float::to_integer` rounds to nearest, which
