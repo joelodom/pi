@@ -1,13 +1,18 @@
 //! `pi` — CLI for computing pi and verifying digit files.
 //!
-//! Two modes, picked by which flags are given:
+//! Three modes, picked by which flags are given:
 //!   * Compute (`--digits`, `-o`, ...): drive a [`PiAlgorithm`] to produce
 //!     N digits and stream them through a [`DigitSink`].
 //!   * Verify (`--verify A B`): byte-by-byte compare two digit files,
 //!     ignoring trailing whitespace.  The shorter file's content must
 //!     match the matching prefix of the longer file's content.
+//!   * Verify-hex (`--verify-hex HEX_FILE [--from-decimal DEC_FILE]`):
+//!     spot-check hex digits of pi using the BBP formula as an
+//!     independent oracle.  See `verify_hex` module.
 //!
 //! Running `pi` with no arguments prints the help text.
+
+mod verify_hex;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -53,6 +58,32 @@ struct Cli {
     /// file's content.  Skips computation entirely.
     #[arg(long, value_names = ["FILE_A", "FILE_B"], num_args = 2)]
     verify: Option<Vec<PathBuf>>,
+
+    /// Verify the hex digits of a pi file using BBP as an independent
+    /// oracle.  Use an existing converted hex file if it exists, or pass
+    /// `--from-decimal <FILE>` to create it from a decimal pi file.
+    /// Runs until interrupted (Ctrl-C) or a mismatch is detected.
+    #[arg(long, value_name = "HEX_FILE")]
+    verify_hex: Option<PathBuf>,
+
+    /// Decimal pi file to convert when `--verify-hex` is given and the
+    /// hex file doesn't yet exist.  Ignored otherwise.
+    #[arg(long, value_name = "DECIMAL_FILE", requires = "verify_hex")]
+    from_decimal: Option<PathBuf>,
+
+    /// `--verify-hex`: BBP samples per random window (each BBP call
+    /// verifies 8 consecutive hex digits).
+    #[arg(long, default_value_t = 100, value_name = "M", requires = "verify_hex")]
+    samples_per_window: usize,
+
+    /// `--verify-hex`: BBP samples per sanity region (first/middle/last 1M).
+    #[arg(long, default_value_t = 100, value_name = "N", requires = "verify_hex")]
+    sanity_samples: usize,
+
+    /// `--verify-hex`: number of rayon worker threads.  Defaults to all
+    /// available cores.
+    #[arg(long, value_name = "J", requires = "verify_hex")]
+    jobs: Option<usize>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -80,6 +111,16 @@ fn main() -> Result<()> {
         // silently if that constraint ever changes.
         assert_eq!(files.len(), 2, "--verify takes exactly two file arguments");
         return run_verify(&files[0], &files[1]);
+    }
+
+    if let Some(hex_path) = cli.verify_hex.as_deref() {
+        return verify_hex::run(
+            hex_path,
+            cli.from_decimal.as_deref(),
+            cli.samples_per_window,
+            cli.sanity_samples,
+            cli.jobs,
+        );
     }
 
     run_compute(cli)
@@ -263,7 +304,7 @@ fn file_content_length(path: &Path) -> Result<u64> {
 }
 
 /// Render `n` with `,` as a thousands separator (e.g. `1_234_567` -> `"1,234,567"`).
-fn fmt_thousands(n: u64) -> String {
+pub(crate) fn fmt_thousands(n: u64) -> String {
     let s = n.to_string();
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(bytes.len() + bytes.len() / 3);

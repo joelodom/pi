@@ -19,6 +19,7 @@
 //! FFT multiplication is what makes a million-digit run finish in seconds.
 
 pub mod algorithm;
+pub mod bbp;
 pub mod output;
 pub mod precision;
 pub mod progress;
