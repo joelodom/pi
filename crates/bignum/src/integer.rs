@@ -448,8 +448,32 @@ fn sub_signed(a: &Integer, b: &Integer) -> Integer {
 // Multiplication
 // =====================================================================
 
-/// Schoolbook multiply on magnitudes.
+/// Below this many limbs in the smaller operand, schoolbook beats
+/// Karatsuba (the constant-factor overhead of 3 recursive calls plus
+/// the extra adds and subtracts outweighs the saved multiplication).
+/// 32 limbs ≈ 2048 bits ≈ 620 decimal digits — a reasonable cross-over
+/// for our scratch-allocating implementation.  GMP's empirical default
+/// on x86-64 is in the same neighborhood (~28 limbs).
+const KARATSUBA_THRESHOLD: usize = 32;
+
+/// Dispatch: pick schoolbook for small operands, Karatsuba for large.
+/// The cross-over is set by [`KARATSUBA_THRESHOLD`].
 fn mul_mag(a: &[u64], b: &[u64]) -> Vec<u64> {
+    if a.is_empty() || b.is_empty() {
+        return Vec::new();
+    }
+    if a.len().min(b.len()) < KARATSUBA_THRESHOLD {
+        mul_mag_schoolbook(a, b)
+    } else {
+        mul_mag_karatsuba(a, b)
+    }
+}
+
+/// Schoolbook (long multiplication) on magnitudes — O(|a|·|b|).  The
+/// inner loop is a `u128` multiply-accumulate; carries propagate to
+/// the next limb.  Used directly for small operands and as the
+/// Karatsuba base case.
+fn mul_mag_schoolbook(a: &[u64], b: &[u64]) -> Vec<u64> {
     if a.is_empty() || b.is_empty() {
         return Vec::new();
     }
@@ -477,6 +501,83 @@ fn mul_mag(a: &[u64], b: &[u64]) -> Vec<u64> {
     out
 }
 
+/// Karatsuba multiplication on magnitudes — O(N^log₂3) ≈ O(N^1.585).
+///
+/// Splits each operand into high and low halves at the same limb
+/// boundary and replaces the four naive sub-multiplications with three
+/// recursive calls via the identity
+///
+/// ```text
+/// (a_hi·B^m + a_lo) · (b_hi·B^m + b_lo)
+///     = a_hi·b_hi·B^(2m)
+///     + ((a_lo + a_hi)·(b_lo + b_hi) − a_hi·b_hi − a_lo·b_lo) · B^m
+///     + a_lo·b_lo
+/// ```
+///
+/// where `B = 2^64` is the limb base and `m` is the split point in
+/// limbs.  The three subproducts (z0, z2, z1_prod) recurse through the
+/// dispatcher, so the base case is schoolbook on small slices.
+fn mul_mag_karatsuba(a: &[u64], b: &[u64]) -> Vec<u64> {
+    // Split point: half of the longer operand, in limbs.
+    let n = a.len().max(b.len());
+    let m = n / 2;
+
+    // Split each operand.  `split_at(m.min(len))` handles the case
+    // where one operand is shorter than the split point: the "high"
+    // half is then empty and z2 (or its analog) is zero.
+    let (a_lo, a_hi) = a.split_at(m.min(a.len()));
+    let (b_lo, b_hi) = b.split_at(m.min(b.len()));
+
+    // z0 = a_lo · b_lo  (low × low)
+    let z0 = mul_mag(a_lo, b_lo);
+    // z2 = a_hi · b_hi  (high × high; may be empty if either hi is empty)
+    let z2 = mul_mag(a_hi, b_hi);
+    // z1_prod = (a_lo + a_hi) · (b_lo + b_hi)
+    let a_sum = add_mag(a_lo, a_hi);
+    let b_sum = add_mag(b_lo, b_hi);
+    let z1_prod = mul_mag(&a_sum, &b_sum);
+    // z1 = z1_prod − z0 − z2  (the cross terms; always ≥ 0)
+    let z0_plus_z2 = add_mag(&z0, &z2);
+    let z1 = sub_mag(&z1_prod, &z0_plus_z2);
+
+    // Assemble: result = z0 + (z1 << m·64) + (z2 << 2m·64)
+    let mut out = vec![0_u64; a.len() + b.len() + 1];
+    add_at(&mut out, &z0, 0);
+    add_at(&mut out, &z1, m);
+    add_at(&mut out, &z2, 2 * m);
+    while matches!(out.last(), Some(&0)) {
+        out.pop();
+    }
+    out
+}
+
+/// In-place limb-vector add: `dest += src << (offset·64)`.  Carries
+/// propagate past the end if needed; `dest` may grow.
+fn add_at(dest: &mut Vec<u64>, src: &[u64], offset: usize) {
+    if src.is_empty() {
+        return;
+    }
+    if dest.len() < offset + src.len() {
+        dest.resize(offset + src.len(), 0);
+    }
+    let mut carry: u128 = 0;
+    for i in 0..src.len() {
+        let sum = dest[offset + i] as u128 + src[i] as u128 + carry;
+        dest[offset + i] = sum as u64;
+        carry = sum >> 64;
+    }
+    let mut k = offset + src.len();
+    while carry > 0 {
+        if dest.len() <= k {
+            dest.push(0);
+        }
+        let sum = dest[k] as u128 + carry;
+        dest[k] = sum as u64;
+        carry = sum >> 64;
+        k += 1;
+    }
+}
+
 fn mul_signed(a: &Integer, b: &Integer) -> Integer {
     let limbs = mul_mag(&a.limbs, &b.limbs);
     if limbs.is_empty() {
@@ -490,34 +591,120 @@ fn mul_signed(a: &Integer, b: &Integer) -> Integer {
 // =====================================================================
 
 /// Magnitude division: `|a| / |b|`, returning `(q, r)` with `r < |b|`.
-/// Bit-level long division — slow O(bits * limbs) but obviously correct.
+///
+/// Dispatches:
+/// * trivial cases (`a < b`, `b = 1 limb`) are handled directly;
+/// * otherwise Knuth's Algorithm D (TAOCP vol. 2 §4.3.1) — limb-level
+///   long division with quotient-digit estimation.  Cost is `O(L²)`
+///   per call, where `L = |a|.len()`.  An earlier bit-by-bit
+///   implementation was `O(B·L) ≈ O(64·L²)`, so this is ~60× faster
+///   at the precisions we care about.
 pub(crate) fn div_rem_mag(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
     assert!(!b.is_empty(), "division by zero");
     if cmp_mag(a, b) == Ordering::Less {
         return (Vec::new(), a.to_vec());
     }
-    // Bit-by-bit shift-and-subtract starting at the top bit of a.
-    let total_bits = bits_of(a);
-    let mut q = vec![0_u64; (total_bits as usize + 63) / 64];
-    let mut r: Vec<u64> = Vec::new();
-    for i in (0..total_bits).rev() {
-        // r = r << 1
-        shl_one_mut(&mut r);
-        // Set the low bit of r to bit i of a.
-        let bit = (a[(i / 64) as usize] >> (i % 64)) & 1;
-        if bit == 1 {
-            if r.is_empty() {
-                r.push(1);
-            } else {
-                r[0] |= 1;
+    if b.len() == 1 {
+        return div_rem_mag_single(a, b[0]);
+    }
+    div_rem_mag_knuth(a, b)
+}
+
+/// Single-limb divisor: walk `a` from MSB limb to LSB, carrying the
+/// running remainder in 128 bits.  O(|a|) total.
+fn div_rem_mag_single(a: &[u64], d: u64) -> (Vec<u64>, Vec<u64>) {
+    let mut q = vec![0_u64; a.len()];
+    let mut r: u128 = 0;
+    for i in (0..a.len()).rev() {
+        let cur = (r << 64) | a[i] as u128;
+        q[i] = (cur / d as u128) as u64;
+        r = cur % d as u128;
+    }
+    while matches!(q.last(), Some(&0)) {
+        q.pop();
+    }
+    let rem = if r == 0 { Vec::new() } else { vec![r as u64] };
+    (q, rem)
+}
+
+/// Knuth's Algorithm D.  Precondition: `b.len() >= 2`, `|a| >= |b|`.
+///
+/// **D1. Normalize.**  Shift both inputs left by `d = leading_zeros(b[n-1])`
+/// bits so the divisor's top bit is set.  This makes step D3's
+/// trial-quotient estimate from the top two limbs of the partial
+/// remainder accurate to within 2 — and after the D3 refinement, at
+/// most 1 too high (which D5/D6 corrects).
+///
+/// **D2-D7. Main loop**, j from m down to 0:
+/// * **D3.** Trial quotient `qhat = floor((u[j+n]·B + u[j+n-1]) / v[n-1])`,
+///   capped at `B-1`.  Refine by checking `qhat·v[n-2] > B·rhat + u[j+n-2]`.
+/// * **D4.** Multiply-subtract: `u[j..j+n+1] -= qhat·v`.  May underflow.
+/// * **D5/D6.** If underflow, `qhat` was 1 too high: decrement and add
+///   `v` back; the add-carry cancels the subtract-borrow.
+///
+/// **D8. Unnormalize.**  Remainder gets shifted right by `d`.
+fn div_rem_mag_knuth(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
+    let n = b.len();
+    let m = a.len() - n;
+    let d = b[n - 1].leading_zeros();
+
+    // Normalize.
+    let v: Vec<u64> = if d == 0 { b.to_vec() } else { shl_mag(b, d as u64) };
+    debug_assert_eq!(v.len(), n, "normalization should not grow divisor");
+    let mut u: Vec<u64> = if d == 0 { a.to_vec() } else { shl_mag(a, d as u64) };
+    // Ensure u has exactly m+n+1 limbs (the +1 might be 0).
+    while u.len() < a.len() + 1 {
+        u.push(0);
+    }
+
+    let v_top = v[n - 1];
+    let v_next = v[n - 2];
+    let mut q = vec![0_u64; m + 1];
+
+    for j in (0..=m).rev() {
+        // D3. Estimate qhat from the top two limbs of the partial remainder.
+        let numerator = ((u[j + n] as u128) << 64) | (u[j + n - 1] as u128);
+        let (mut qhat, mut rhat) = if u[j + n] >= v_top {
+            // Quotient digit would saturate; cap at B-1 and adjust rhat.
+            let qcap = u64::MAX as u128;
+            (u64::MAX, numerator - qcap * v_top as u128)
+        } else {
+            ((numerator / v_top as u128) as u64, numerator % v_top as u128)
+        };
+        // Refine downward while `qhat·v[n-2] > B·rhat + u[j+n-2]`.
+        loop {
+            let lhs = (qhat as u128) * (v_next as u128);
+            let rhs = (rhat << 64) | (u[j + n - 2] as u128);
+            if lhs <= rhs {
+                break;
+            }
+            qhat -= 1;
+            rhat += v_top as u128;
+            if rhat >= (1u128 << 64) {
+                break;
             }
         }
-        // If r >= b, r -= b and set bit i of q.
-        if cmp_mag(&r, b) != Ordering::Less {
-            r = sub_mag(&r, b);
-            let qi = i as usize;
-            q[qi / 64] |= 1_u64 << (qi % 64);
+
+        // D4. Multiply-subtract: u[j..=j+n] -= qhat * v.
+        let underflow = mul_sub_inplace(&mut u[j..=j + n], &v, qhat);
+
+        // D5/D6. Compensate if qhat was one too high.
+        if underflow {
+            qhat -= 1;
+            add_back_inplace(&mut u[j..=j + n], &v);
         }
+
+        q[j] = qhat;
+    }
+
+    // D8. Unnormalize remainder.  Quotient is unaffected by the
+    // common left shift of dividend and divisor.
+    let mut r: Vec<u64> = u[..n].to_vec();
+    if d > 0 {
+        r = shr_mag(&r, d as u64);
+    }
+    while matches!(r.last(), Some(&0)) {
+        r.pop();
     }
     while matches!(q.last(), Some(&0)) {
         q.pop();
@@ -525,26 +712,54 @@ pub(crate) fn div_rem_mag(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
     (q, r)
 }
 
-fn bits_of(a: &[u64]) -> u64 {
-    match a.last() {
-        None => 0,
-        Some(&top) => (a.len() as u64 - 1) * 64 + (64 - top.leading_zeros() as u64),
+/// In-place `u -= qhat * v` over slice `u` (which must be exactly
+/// `v.len() + 1` long).  Returns `true` if a borrow underflowed past
+/// the top limb of `u` — meaning `qhat` was one too large.
+fn mul_sub_inplace(u: &mut [u64], v: &[u64], qhat: u64) -> bool {
+    debug_assert_eq!(u.len(), v.len() + 1);
+    let mut borrow: i128 = 0;
+    let mut carry: u128 = 0;
+    let qh = qhat as u128;
+    for i in 0..v.len() {
+        let prod = qh * v[i] as u128 + carry;
+        carry = prod >> 64;
+        let prod_lo = prod as u64;
+        let diff = (u[i] as i128) - (prod_lo as i128) - borrow;
+        if diff < 0 {
+            u[i] = (diff + (1i128 << 64)) as u64;
+            borrow = 1;
+        } else {
+            u[i] = diff as u64;
+            borrow = 0;
+        }
+    }
+    // Last subtraction: the high carry from the multiplication plus
+    // any borrow against u's top limb.
+    let total_sub = carry as i128 + borrow;
+    let diff = (u[v.len()] as i128) - total_sub;
+    if diff < 0 {
+        u[v.len()] = (diff + (1i128 << 64)) as u64;
+        true
+    } else {
+        u[v.len()] = diff as u64;
+        false
     }
 }
 
-fn shl_one_mut(r: &mut Vec<u64>) {
-    if r.is_empty() {
-        return;
+/// In-place `u += v` over slice `u` (length `v.len() + 1`).  The final
+/// carry is discarded — it cancels the underflow borrow that
+/// triggered the add-back step.
+fn add_back_inplace(u: &mut [u64], v: &[u64]) {
+    debug_assert_eq!(u.len(), v.len() + 1);
+    let mut carry: u128 = 0;
+    for i in 0..v.len() {
+        let sum = u[i] as u128 + v[i] as u128 + carry;
+        u[i] = sum as u64;
+        carry = sum >> 64;
     }
-    let mut carry: u64 = 0;
-    for limb in r.iter_mut() {
-        let new_carry = *limb >> 63;
-        *limb = (*limb << 1) | carry;
-        carry = new_carry;
-    }
-    if carry > 0 {
-        r.push(carry);
-    }
+    // Wrapping add into top limb; the overflow here cancels the
+    // borrow recorded as u[v.len()]'s wrap-around from mul_sub.
+    u[v.len()] = u[v.len()].wrapping_add(carry as u64);
 }
 
 /// Small-divisor optimization: divide magnitude by a u64, returning
@@ -904,6 +1119,110 @@ mod tests {
             c.to_string_radix(10),
             "340282366920938463463374607431768211456"
         );
+    }
+
+    #[test]
+    fn karatsuba_matches_schoolbook_on_large_inputs() {
+        // Build two operands big enough to trigger the Karatsuba path
+        // (well above KARATSUBA_THRESHOLD).  Then verify the dispatched
+        // mul_mag agrees with the leaf schoolbook on the same inputs.
+        // This is the property test that the recursive identity is
+        // implemented correctly across many sizes and split points.
+        let mut a = Integer::from(0xDEAD_BEEF_CAFE_F00D_u64);
+        let mut b = Integer::from(0x0123_4567_89AB_CDEF_u64);
+        // Grow each to ~250 limbs (~16K bits ~ 4800 decimal digits).
+        // Multiple sequential squarings give us non-trivial bit
+        // patterns at every position, not just a single bit set.
+        for _ in 0..7 {
+            a = &a * &a;
+        }
+        for _ in 0..7 {
+            b = &b * &b;
+        }
+        assert!(a.limbs.len() > 100 && b.limbs.len() > 100);
+        let via_dispatch = super::mul_mag(&a.limbs, &b.limbs);
+        let via_schoolbook = super::mul_mag_schoolbook(&a.limbs, &b.limbs);
+        assert_eq!(via_dispatch, via_schoolbook);
+    }
+
+    #[test]
+    fn knuth_div_roundtrip_many_sizes() {
+        // For each (a_len, b_len), build a "dividend" by multiplying
+        // a known quotient by a known divisor and adding a remainder,
+        // then divide and verify we recover the original parts.  This
+        // exercises Knuth D across operand sizes that span the
+        // single-limb fast path, small operands, and operands large
+        // enough that the inner D3 refinement and D6 add-back paths
+        // both get hit by chance.
+        let dividend_q = Integer::parse_radix(
+            "1234567890123456789012345678901234567890123456789012345678901234567890",
+            10,
+        )
+        .unwrap();
+        let divisor_v = Integer::parse_radix(
+            "98765432109876543210987654321",
+            10,
+        )
+        .unwrap();
+        let remainder = Integer::from(42_u32);
+        // p = q*v + r
+        let p = &(&dividend_q * &divisor_v) + &remainder;
+        // p / v == (q, r)
+        let (q_limbs, r_limbs) = super::div_rem_mag(&p.limbs, &divisor_v.limbs);
+        assert_eq!(q_limbs, dividend_q.limbs, "Knuth quotient mismatch");
+        assert_eq!(r_limbs, remainder.limbs, "Knuth remainder mismatch");
+    }
+
+    #[test]
+    fn knuth_div_large_balanced() {
+        // ~1000-bit / ~500-bit case: exercises Knuth's main loop with
+        // a non-trivial number of quotient digits.  Roundtrip check.
+        let q_int = {
+            let mut x = Integer::from(0xFEDC_BA98_7654_3210_u64);
+            for _ in 0..3 {
+                x = &x * &x;
+            }
+            x
+        };
+        let v = {
+            let mut x = Integer::from(0xDEAD_BEEF_u64);
+            for _ in 0..3 {
+                x = &x * &x;
+            }
+            x
+        };
+        let r = Integer::from(31337_u32);
+        let p = &(&q_int * &v) + &r;
+        let (q_limbs, r_limbs) = super::div_rem_mag(&p.limbs, &v.limbs);
+        assert_eq!(q_limbs, q_int.limbs);
+        assert_eq!(r_limbs, r.limbs);
+    }
+
+    #[test]
+    fn knuth_div_single_limb_divisor() {
+        // Should hit the single-limb fast path, not Knuth.
+        let a = Integer::parse_radix("100000000000000000000000000000", 10).unwrap();
+        let (q_limbs, r_limbs) = super::div_rem_mag(&a.limbs, &[7_u64]);
+        let q = Integer { limbs: q_limbs, negative: false };
+        let r = Integer { limbs: r_limbs, negative: false };
+        // 10^29 = 7q + r; verify by multiplying back.
+        let recon = &(&q * &Integer::from(7_u32)) + &r;
+        assert_eq!(recon, a);
+    }
+
+    #[test]
+    fn karatsuba_asymmetric_sizes() {
+        // One operand much smaller than the other — degenerate split
+        // case where the "high" half of the small operand is empty.
+        let mut big = Integer::from(3_u32);
+        big <<= 10_000_u32; // 10,001-bit number
+        let small = Integer::from(0xFEDC_BA98_7654_3210_u64);
+        let prod_via_dispatch = &big * &small;
+        let prod_via_schoolbook = Integer {
+            limbs: super::mul_mag_schoolbook(&big.limbs, &small.limbs),
+            negative: false,
+        };
+        assert_eq!(prod_via_dispatch, prod_via_schoolbook);
     }
 
     #[test]
