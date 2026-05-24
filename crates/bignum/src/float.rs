@@ -328,7 +328,7 @@ impl Float {
     }
 
     /// `self * rhs`.
-    fn mul_at_prec(&self, rhs: &Float, prec: u64) -> Float {
+    pub(crate) fn mul_at_prec(&self, rhs: &Float, prec: u64) -> Float {
         if self.is_zero() || rhs.is_zero() {
             return Float { prec, sign: false, mantissa: Integer::new(), exp: 0 };
         }

@@ -935,8 +935,18 @@ fn write_decimal_naive(n: &Integer, out: &mut String) {
 
 /// Quotient and remainder of `a / b` as `Integer`s.  Helper for D&C
 /// stringification; works on any non-negative `a` and `b`.
+///
+/// Dispatches: large operands use Newton–Raphson reciprocal division
+/// (O(M(N)) via Karatsuba); small ones stay on Knuth's Algorithm D,
+/// whose constants win below the crossover.
 fn div_rem_signed(a: &Integer, b: &Integer) -> (Integer, Integer) {
     debug_assert!(!a.negative && !b.negative && !b.is_zero());
+    if b.limbs.len() >= NEWTON_DIV_THRESHOLD
+        && a.limbs.len() >= NEWTON_DIV_THRESHOLD
+        && cmp_mag(&a.limbs, &b.limbs) != Ordering::Less
+    {
+        return div_rem_newton(a, b);
+    }
     let (q, r) = div_rem_mag(&a.limbs, &b.limbs);
     let qi = if q.is_empty() {
         Integer::new()
@@ -949,6 +959,82 @@ fn div_rem_signed(a: &Integer, b: &Integer) -> (Integer, Integer) {
         Integer { limbs: r, negative: false }
     };
     (qi, ri)
+}
+
+/// Crossover above which `div_rem_signed` uses Newton–Raphson reciprocal
+/// division instead of Knuth Algorithm D.  Below this size Knuth's
+/// lower constants (no Float setup, no reciprocal iteration) win; above
+/// it NR's O(M(N)) asymptotic dominates Knuth's O(N²).  Picked to land
+/// well above Karatsuba's own threshold so the multiplications inside
+/// NR are themselves subquadratic.
+const NEWTON_DIV_THRESHOLD: usize = 64;
+
+/// Newton–Raphson reciprocal integer division for non-negative operands.
+/// Returns `(a / b, a mod b)` exactly.
+///
+/// Strategy:
+/// 1. Compute `1/b` as a Float at `q_bits + guard` precision via the
+///    existing precision-doubling NR reciprocal.
+/// 2. `q ≈ floor(a · recip)`.  With enough guard bits the floored
+///    quotient is exact, or off by ±1.
+/// 3. Compute `r = a − q·b` exactly and correct `q` by ±1 if needed.
+///
+/// Cost is dominated by two Karatsuba multiplies plus one reciprocal
+/// (itself a geometric series of multiplies summing to O(M(N))).  That
+/// is asymptotically O(M(N)) ≈ O(N^1.585) versus Knuth's O(N²); the
+/// crossover sits around `NEWTON_DIV_THRESHOLD` limbs.
+fn div_rem_newton(a: &Integer, b: &Integer) -> (Integer, Integer) {
+    debug_assert!(!a.negative && !b.negative && !b.is_zero());
+    debug_assert!(cmp_mag(&a.limbs, &b.limbs) != Ordering::Less);
+
+    let a_bits = a.bits();
+    let b_bits = b.bits();
+    let q_bits = a_bits - b_bits + 1;
+
+    // Working precision.  64 guard bits soaks up:
+    // (a) the residual error of the final Newton iteration in
+    //     `reciprocal_at_prec` (a few ulps), and
+    // (b) the rounding of `a` into a `prec`-bit Float mantissa before
+    //     the multiplication.
+    // Combined they leave the floored quotient off by at most ±1, which
+    // the correction loop handles.
+    let prec = q_bits + 64;
+
+    // Reciprocal of b at `prec` bits.
+    let b_float: crate::float::Float = b.into();
+    let recip = b_float.reciprocal_at_prec(prec);
+
+    // a · recip ≈ a / b.  Truncate `a` to `prec` bits first so the
+    // multiplication doesn't operate on a's full mantissa — we don't
+    // need its low bits for an integer quotient of ~q_bits magnitude.
+    let a_float: crate::float::Float = a.into();
+    let a_trunc = a_float.truncated_to_prec(prec);
+    let q_float = a_trunc.mul_at_prec(&recip, prec);
+
+    // Floor.  q_float ≥ 0 (both inputs non-negative), so Round::Down
+    // is plain truncation toward zero.
+    let (mut q, _) = q_float
+        .to_integer_round(crate::Round::Down)
+        .expect("to_integer_round returned None for finite Float");
+
+    // Exact remainder, then correct q by ±1 if the Float-based estimate
+    // was off.  With prec = q_bits + 64 the loops fire zero or one
+    // time in practice; written as loops as defence in depth.
+    let one = Integer::from(1_u32);
+    let mut r = a - &(&q * b);
+    while r.negative && !r.is_zero() {
+        q = &q - &one;
+        r = &r + b;
+    }
+    while !r.negative && cmp_mag(&r.limbs, &b.limbs) != Ordering::Less {
+        q = &q + &one;
+        r = &r - b;
+    }
+
+    debug_assert!(!r.negative);
+    debug_assert!(r.is_zero() || cmp_mag(&r.limbs, &b.limbs) == Ordering::Less);
+
+    (q, r)
 }
 
 /// Decimal-digit count estimate from bit count using `log₁₀ 2`.
@@ -1504,5 +1590,91 @@ mod tests {
             expected.push('0');
         }
         assert_eq!(s, expected);
+    }
+
+    // ----- Newton-Raphson division ------------------------------------
+
+    /// Cheap deterministic Integer generator for property-style tests.
+    /// Produces a value of roughly `n_limbs` limbs from a seed.
+    fn make_int(seed: u64, n_limbs: usize) -> Integer {
+        let mut limbs = Vec::with_capacity(n_limbs);
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..n_limbs {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            limbs.push(s);
+        }
+        // Ensure top limb is nonzero so we hit `n_limbs` exactly.
+        if let Some(top) = limbs.last_mut() {
+            *top |= 1u64 << 63;
+        } else {
+            limbs.push(1);
+        }
+        Integer { limbs, negative: false }
+    }
+
+    fn assert_divmod_matches_knuth(a: &Integer, b: &Integer) {
+        let (q_nr, r_nr) = div_rem_newton(a, b);
+        let (q_k, r_k) = div_rem_mag(&a.limbs, &b.limbs);
+        let q_k = Integer { limbs: q_k, negative: false };
+        let r_k = Integer { limbs: r_k, negative: false };
+        assert_eq!(q_nr.to_string_radix(16), q_k.to_string_radix(16),
+            "quotient mismatch: a={} b={}", a.to_string_radix(16), b.to_string_radix(16));
+        assert_eq!(r_nr.to_string_radix(16), r_k.to_string_radix(16),
+            "remainder mismatch");
+        // Sanity: q·b + r == a.
+        let recon = &(&q_nr * b) + &r_nr;
+        assert_eq!(recon.to_string_radix(16), a.to_string_radix(16),
+            "q·b + r != a");
+    }
+
+    #[test]
+    fn newton_div_matches_knuth_small() {
+        // Just above the threshold so the NR path is exercised.
+        for seed in 0..16u64 {
+            let a = make_int(seed * 2 + 1, 200);
+            let b = make_int(seed * 2 + 2, 100);
+            assert_divmod_matches_knuth(&a, &b);
+        }
+    }
+
+    #[test]
+    fn newton_div_matches_knuth_unbalanced() {
+        // Very large numerator, small (but above threshold) divisor.
+        let a = make_int(7, 2000);
+        let b = make_int(11, 70);
+        assert_divmod_matches_knuth(&a, &b);
+    }
+
+    #[test]
+    fn newton_div_matches_knuth_near_equal() {
+        // a only slightly larger than b — quotient is small but the
+        // Float estimate must still land within ±1.
+        let b = make_int(13, 500);
+        let a = &(&b * &Integer::from(7_u32)) + &Integer::from(3_u32);
+        assert_divmod_matches_knuth(&a, &b);
+    }
+
+    #[test]
+    fn newton_div_power_of_ten_splitter() {
+        // The exact pattern hit by D&C base conversion: divide a large
+        // random integer by 10^m, where m makes 10^m straddle the
+        // threshold.
+        for digits in [500_u32, 1500, 4000] {
+            let b = Integer::u_pow_u(10, digits);
+            let a = make_int(digits as u64, b.limbs.len() * 2 + 5);
+            assert_divmod_matches_knuth(&a, &b);
+        }
+    }
+
+    #[test]
+    fn newton_div_large() {
+        // ~64K limb (~4M bit) numerator over a ~32K limb divisor —
+        // representative of the top-level division in 1M-digit base
+        // conversion.  Confirms correctness at production sizes.
+        let b = make_int(101, 32_000);
+        let a = make_int(103, 64_000);
+        assert_divmod_matches_knuth(&a, &b);
     }
 }
