@@ -76,19 +76,34 @@ pub fn generate(digits: u64, hw: &HardwareProfile) -> String {
         _ => 64,
     };
 
+    // Decide disk-backing first; it changes how aggressive the
+    // memory-saving knobs below need to be.
+    let disk_limb_threshold = pick_disk_limb_threshold(digits, est_peak_full_gb, ram_gb);
+    let disk_engaged = disk_limb_threshold != usize::MAX;
+
     // sequential_top_threshold (terms): only meaningful when memory
     // is tight; sized so the top few levels of the tree serialise.
-    // Empirically `digits / 1000` (in terms ≈ digits / 14000 × 14)
-    // gave good results on a 1B run with an 18 GB laptop.
+    // Two regimes:
+    //   * Disk-backed: only need to bound *concurrent NTT scratch*.
+    //     Integer memory spills to disk, so we only need to keep the
+    //     handful of largest-N NTT calls serialised.  Empirically
+    //     ~digits/30 catches just the top 1–2 levels at billion scale.
+    //   * No disk-backing: must bound both NTT scratch AND total
+    //     concurrent Integer state.  Much more aggressive — digits/1000.
     let sequential_top_threshold = match memory_mode {
         MemoryMode::Speed => 0,
         MemoryMode::Moderate => 0,
-        // For 1B: digits / 1000 = 1_000_000 (matches what we tested).
+        MemoryMode::Conservative if disk_engaged => digits / 30,
         MemoryMode::Conservative => digits / 1000,
     };
 
+    // With disk-backing, the FA Float intermediates spill to disk too,
+    // so concurrent recip+sqrt chains don't double live memory the way
+    // they did in pure-RAM mode.  Keep parallel FA on when disk handles
+    // the pressure.
     let parallel_final_assembly = match memory_mode {
         MemoryMode::Speed | MemoryMode::Moderate => true,
+        MemoryMode::Conservative if disk_engaged => true,
         MemoryMode::Conservative => false,
     };
 
@@ -142,6 +157,25 @@ pub fn generate(digits: u64, hw: &HardwareProfile) -> String {
     writeln!(s).unwrap();
     writeln!(s, "# Newton-Raphson reciprocal division above this size.  Algorithmic.").unwrap();
     writeln!(s, "newton_div_threshold = 64").unwrap();
+    writeln!(s).unwrap();
+    if disk_limb_threshold == usize::MAX {
+        writeln!(s, "# Disk-backed integer storage is disabled — peak RSS is").unwrap();
+        writeln!(s, "# expected to fit comfortably in RAM.  Set lower to push").unwrap();
+        writeln!(s, "# the biggest Integers to mmap'd scratch files (see").unwrap();
+        writeln!(s, "# bignum::storage), at a wall-time cost from SSD access.").unwrap();
+        writeln!(s, "# disk_limb_threshold = 18446744073709551615   # usize::MAX = disabled").unwrap();
+    } else {
+        writeln!(s, "# MEMORY-CONSERVATIVE: Integer limb buffers ≥ {} limbs",
+            fmt_thousands(disk_limb_threshold as u64)).unwrap();
+        writeln!(s, "# (~{} MB each) are allocated via `mmap`-backed scratch",
+            disk_limb_threshold * 8 / (1024 * 1024)).unwrap();
+        writeln!(s, "# files in `$TMPDIR` instead of heap memory.  Active because").unwrap();
+        writeln!(s, "# estimated peak ({:.1} GB) > 70% of available RAM ({:.1} GB).",
+            est_peak_full_gb, ram_gb).unwrap();
+        writeln!(s, "# Run wall time will rise (SSD bandwidth replaces RAM); the").unwrap();
+        writeln!(s, "# trade-off is what makes 1B-10B runs feasible on this box.").unwrap();
+        writeln!(s, "disk_limb_threshold = {disk_limb_threshold}").unwrap();
+    }
     writeln!(s).unwrap();
 
     // [bignum.ntt]
@@ -232,6 +266,29 @@ fn write_memory_mode_rationale(s: &mut String, mode: MemoryMode, est_gb: f64, ra
             writeln!(s, "#   bound concurrent NTT scratch.  Some swap activity expected; the").unwrap();
             writeln!(s, "#   run completes but watch `major_faults` in --performance-file.").unwrap();
         }
+    }
+}
+
+/// Pick `disk_limb_threshold` for the host.
+///
+/// If estimated peak RSS fits comfortably in RAM (< 70%), disable
+/// disk-backing entirely (`usize::MAX`).  Otherwise pick a threshold
+/// just above the typical mid-tree Integer size, so the few largest
+/// Integers (q, t, denom_int, pi mantissa, top-of-tree merges) go to
+/// mmap while small/medium ones stay in RAM.
+///
+/// Heuristic: the largest live Integer is roughly `digits / 19` limbs
+/// (full mantissa).  Threshold = `digits / 200` catches anything
+/// roughly 10% the size of the mantissa or bigger.  Tunable later via
+/// `--config`.
+fn pick_disk_limb_threshold(digits: u64, est_peak_gb: f64, ram_gb: f64) -> usize {
+    if ram_gb <= 0.0 || est_peak_gb < ram_gb * 0.7 {
+        usize::MAX
+    } else {
+        // Cap at ~10M limbs so we never disk-back tiny intermediates
+        // even on extreme runs.  At 1B digits this gives 5M; at 10B
+        // it gives 50M (capped to 10M).
+        ((digits / 200) as usize).clamp(50_000, 10_000_000)
     }
 }
 

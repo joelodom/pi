@@ -226,6 +226,7 @@ impl PerfRecorder {
                 \"newton_div_threshold\":{},\
                 \"to_string_dc_threshold\":{},\
                 \"parallel_to_string_threshold\":{},\
+                \"disk_limb_threshold\":{},\
                 \"ntt\":{{\
                     \"target_task_size\":{},\
                     \"parallel_pack_threshold\":{},\
@@ -249,6 +250,7 @@ impl PerfRecorder {
             bn.newton_div_threshold,
             bn.to_string_dc_threshold,
             bn.parallel_to_string_threshold,
+            bn.disk_limb_threshold,
             bn.ntt.target_task_size,
             bn.ntt.parallel_pack_threshold,
             bn.ntt.parallel_pointwise_threshold,
@@ -309,12 +311,22 @@ impl Inner {
         // emitted as monotonically-increasing totals since process
         // start.  The analyst computes deltas between adjacent samples
         // if they want per-interval rates.
+        // bignum disk-backed limb storage counters (zero when no
+        // Integer has crossed `disk_limb_threshold` yet).
+        let mmap_bytes_live = bignum::storage::mmap_bytes_live();
+        let mmap_count_live = bignum::storage::mmap_count_live();
+        let mmap_bytes_total = bignum::storage::mmap_bytes_total_allocated();
+        let mmap_count_total = bignum::storage::mmap_count_total_allocated();
         self.write_line(&format!(
             "{{\"t_ms\":{t},\"kind\":\"sample\",\"phase\":{phase_esc},\
              \"rss_mb\":{rss_mb},\"peak_rss_mb\":{peak_rss_mb},\
              \"cpu_cores\":{cpu_cores:.3},\
              \"minor_faults\":{},\"major_faults\":{},\
-             \"ctx_voluntary\":{},\"ctx_involuntary\":{}}}",
+             \"ctx_voluntary\":{},\"ctx_involuntary\":{},\
+             \"mmap_bytes_live\":{mmap_bytes_live},\
+             \"mmap_count_live\":{mmap_count_live},\
+             \"mmap_bytes_total\":{mmap_bytes_total},\
+             \"mmap_count_total\":{mmap_count_total}}}",
             now.minor_faults,
             now.major_faults,
             now.ctx_voluntary,

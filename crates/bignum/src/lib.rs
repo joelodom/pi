@@ -13,6 +13,7 @@ pub mod config;
 pub mod float;
 pub mod integer;
 pub(crate) mod ntt;
+pub mod storage;
 
 pub use float::Float;
 pub use integer::Integer;

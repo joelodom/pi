@@ -210,7 +210,7 @@ impl Float {
                 if self.exp >= 0 {
                     let mut m = self.mantissa.clone();
                     if self.exp > 0 {
-                        m.limbs = integer::shl_mag(&m.limbs, self.exp as u64);
+                        m.limbs = integer::shl_mag(&m.limbs, self.exp as u64).into();
                     }
                     if self.sign && !m.is_zero() {
                         m.negative = true;
@@ -221,7 +221,7 @@ impl Float {
                     let truncated = integer::shr_mag(&self.mantissa.limbs, shift);
                     // Detect any nonzero discarded bit.
                     let any_low = has_low_bits(&self.mantissa.limbs, shift);
-                    let mut int_part = Integer { limbs: truncated, negative: false };
+                    let mut int_part = Integer { limbs: truncated.into(), negative: false };
                     if self.sign && (!int_part.is_zero() || any_low) {
                         // Negative + nonzero discarded bits => floor goes one lower.
                         if any_low {
@@ -295,12 +295,12 @@ impl Float {
         match a_exp.cmp(&b_exp) {
             Ordering::Greater => {
                 let diff = (a_exp - b_exp) as u64;
-                a_mant.limbs = integer::shl_mag(&a_mant.limbs, diff);
+                a_mant.limbs = integer::shl_mag(&a_mant.limbs, diff).into();
                 a_exp -= diff as i64;
             }
             Ordering::Less => {
                 let diff = (b_exp - a_exp) as u64;
-                b_mant.limbs = integer::shl_mag(&b_mant.limbs, diff);
+                b_mant.limbs = integer::shl_mag(&b_mant.limbs, diff).into();
                 b_exp -= diff as i64;
             }
             Ordering::Equal => {}
@@ -386,9 +386,9 @@ impl Float {
         let needed = want_bits as i64 + b_bits as i64 - a_bits as i64;
         let shift = needed.max(1) as u64;
         let mut a_shifted = self.mantissa.clone();
-        a_shifted.limbs = integer::shl_mag(&a_shifted.limbs, shift);
+        a_shifted.limbs = integer::shl_mag(&a_shifted.limbs, shift).into();
         let (q, _r) = integer::div_rem_mag(&a_shifted.limbs, &rhs.mantissa.limbs);
-        let mantissa = Integer { limbs: q, negative: false };
+        let mantissa = Integer { limbs: q.into(), negative: false };
         let exp = self
             .exp
             .checked_sub(rhs.exp)
@@ -510,7 +510,7 @@ impl Float {
         let mut out = Float {
             prec,
             sign: self.sign,
-            mantissa: Integer { limbs: new_limbs, negative: self.mantissa.negative },
+            mantissa: Integer { limbs: new_limbs.into(), negative: self.mantissa.negative },
             exp: self.exp + (drop_limbs as i64) * 64,
         };
         out.round_to_prec();
@@ -552,7 +552,7 @@ impl Float {
                 new_limbs.push(carry as u64);
             }
         }
-        self.mantissa = Integer { limbs: new_limbs, negative: false };
+        self.mantissa = Integer { limbs: new_limbs.into(), negative: false };
         self.exp = self
             .exp
             .checked_add(drop as i64)
@@ -563,7 +563,7 @@ impl Float {
         let new_bits = self.mantissa.bits();
         if new_bits > self.prec {
             let extra = new_bits - self.prec;
-            self.mantissa.limbs = integer::shr_mag(&self.mantissa.limbs, extra);
+            self.mantissa.limbs = integer::shr_mag(&self.mantissa.limbs, extra).into();
             self.exp += extra as i64;
         }
     }
@@ -676,7 +676,7 @@ impl From<Integer> for Float {
     fn from(v: Integer) -> Self {
         let sign = v.negative;
         let bits = v.bits().max(64);
-        let mantissa = Integer { limbs: v.limbs, negative: false };
+        let mantissa = Integer { limbs: v.limbs.into(), negative: false };
         Float { prec: bits, sign, mantissa, exp: 0 }
     }
 }
@@ -684,7 +684,7 @@ impl<'a> From<&'a Integer> for Float {
     fn from(v: &'a Integer) -> Self {
         let sign = v.negative;
         let bits = v.bits().max(64);
-        let mantissa = Integer { limbs: v.limbs.clone(), negative: false };
+        let mantissa = Integer { limbs: v.limbs.clone().into(), negative: false };
         Float { prec: bits, sign, mantissa, exp: 0 }
     }
 }

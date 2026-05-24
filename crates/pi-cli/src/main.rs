@@ -177,6 +177,13 @@ struct BignumSection {
     ntt_threshold: Option<usize>,
     newton_div_threshold: Option<usize>,
     ntt: NttSection,
+    /// Integer limb count at or above which the limb buffer is mmap-
+    /// backed instead of heap-allocated.  See `bignum::storage`.
+    disk_limb_threshold: Option<usize>,
+    /// Override scratch directory for `mmap`-backed limb storage.
+    /// Empty / unset means use `std::env::temp_dir()` (typically
+    /// `$TMPDIR` on macOS or `/tmp` on Linux).
+    scratch_dir: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -247,6 +254,14 @@ fn load_and_apply_config(path: Option<&Path>, digits: u64) -> Result<()> {
     }
     if let Some(v) = file_cfg.bignum.newton_div_threshold {
         bn.newton_div_threshold = v;
+    }
+    if let Some(v) = file_cfg.bignum.disk_limb_threshold {
+        bn.disk_limb_threshold = v;
+    }
+    if let Some(ref s) = file_cfg.bignum.scratch_dir {
+        if !s.is_empty() {
+            bignum::storage::set_scratch_dir(PathBuf::from(s));
+        }
     }
     if let Some(v) = file_cfg.bignum.ntt.target_task_size {
         bn.ntt.target_task_size = v;

@@ -7,4 +7,5 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+memmap2.workspace = true
 rayon.workspace = true

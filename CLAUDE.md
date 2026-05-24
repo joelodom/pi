@@ -44,6 +44,25 @@ Whatever ends up applied is captured in the perf JSONL `config`
 event right after `run-start`, so a run can be reproduced or
 analyzed without the original TOML file.
 
+## Disk-backed limb storage (`bignum::storage`)
+
+`Integer.limbs` is a `LimbStorage` enum: `Memory(Vec<u64>)` for the
+common path and `Mapped { mmap, file, ... }` for buffers `≥
+disk_limb_threshold` u64s.  Mapped storage uses a temp file in
+`std::env::temp_dir()` (overridable via `bignum.scratch_dir` config),
+unlinked on drop.  The OS page cache handles RAM/SSD eviction
+transparently; sequential access patterns (Karatsuba, pack/unpack)
+stay near RAM speed, random access (NTT bit_reverse on a disk-backed
+buffer) thrashes — don't lower the threshold low enough to push NTT
+*scratch* to disk.
+
+Atomic counters expose live and cumulative mmap bytes/counts; they
+appear in every perf JSONL `sample` event as `mmap_bytes_live`,
+`mmap_count_live`, `mmap_bytes_total`, `mmap_count_total`.
+
+Default is `usize::MAX` (disabled).  The generator picks a non-trivial
+threshold only when `estimated_peak_rss > 70% of RAM`.
+
 ## Don't commit without explicit permission
 
 Each commit is single-use authorization.  The user wants to test

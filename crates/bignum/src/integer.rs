@@ -21,7 +21,7 @@ use crate::Pow;
 #[derive(Clone, Default)]
 pub struct Integer {
     /// Little-endian magnitude limbs.  Always normalized (no trailing zeros).
-    pub(crate) limbs: Vec<u64>,
+    pub(crate) limbs: crate::storage::LimbStorage,
     /// `true` iff the value is strictly negative.
     pub(crate) negative: bool,
 }
@@ -40,7 +40,7 @@ impl std::error::Error for ParseIntegerError {}
 impl Integer {
     /// Construct zero.
     pub fn new() -> Self {
-        Self { limbs: Vec::new(), negative: false }
+        Self { limbs: crate::storage::LimbStorage::new(), negative: false }
     }
 
     /// `true` iff value is zero.
@@ -159,7 +159,7 @@ impl Integer {
         }
         let mut out = String::new();
         let mag = if self.negative {
-            Integer { limbs: self.limbs.clone(), negative: false }
+            Integer { limbs: self.limbs.clone().into(), negative: false }
         } else {
             self.clone()
         };
@@ -247,7 +247,7 @@ impl From<u64> for Integer {
         if v == 0 {
             Self::new()
         } else {
-            Self { limbs: vec![v], negative: false }
+            Self { limbs: vec![v].into(), negative: false }
         }
     }
 }
@@ -265,7 +265,7 @@ impl From<i64> for Integer {
         }
         let negative = v < 0;
         let mag = (v as i128).unsigned_abs() as u64;
-        Self { limbs: vec![mag], negative }
+        Self { limbs: vec![mag].into(), negative }
     }
 }
 
@@ -391,7 +391,7 @@ fn sub_mag(a: &[u64], b: &[u64]) -> Vec<u64> {
 fn add_signed(a: &Integer, b: &Integer) -> Integer {
     if a.negative == b.negative {
         let limbs = add_mag(&a.limbs, &b.limbs);
-        let mut r = Integer { limbs, negative: a.negative };
+        let mut r = Integer { limbs: limbs.into(), negative: a.negative };
         if r.is_zero() {
             r.negative = false;
         }
@@ -402,7 +402,7 @@ fn add_signed(a: &Integer, b: &Integer) -> Integer {
             Ordering::Equal => Integer::new(),
             Ordering::Greater => {
                 let limbs = sub_mag(&a.limbs, &b.limbs);
-                let mut r = Integer { limbs, negative: a.negative };
+                let mut r = Integer { limbs: limbs.into(), negative: a.negative };
                 if r.is_zero() {
                     r.negative = false;
                 }
@@ -410,7 +410,7 @@ fn add_signed(a: &Integer, b: &Integer) -> Integer {
             }
             Ordering::Less => {
                 let limbs = sub_mag(&b.limbs, &a.limbs);
-                let mut r = Integer { limbs, negative: b.negative };
+                let mut r = Integer { limbs: limbs.into(), negative: b.negative };
                 if r.is_zero() {
                     r.negative = false;
                 }
@@ -422,7 +422,7 @@ fn add_signed(a: &Integer, b: &Integer) -> Integer {
 
 fn sub_signed(a: &Integer, b: &Integer) -> Integer {
     // a - b = a + (-b)
-    let neg_b = Integer { limbs: b.limbs.clone(), negative: !b.negative && !b.is_zero() };
+    let neg_b = Integer { limbs: b.limbs.clone().into(), negative: !b.negative && !b.is_zero() };
     add_signed(a, &neg_b)
 }
 
@@ -604,7 +604,7 @@ fn mul_signed(a: &Integer, b: &Integer) -> Integer {
     if limbs.is_empty() {
         return Integer::new();
     }
-    Integer { limbs, negative: a.negative ^ b.negative }
+    Integer { limbs: limbs.into(), negative: a.negative ^ b.negative }
 }
 
 // =====================================================================
@@ -808,7 +808,7 @@ fn div_rem_small(a: &Integer, d: u64) -> (Integer, u64) {
     while matches!(q.last(), Some(&0)) {
         q.pop();
     }
-    let qint = Integer { limbs: q, negative: false };
+    let qint = Integer { limbs: q.into(), negative: false };
     (qint, r as u64)
 }
 
@@ -818,7 +818,7 @@ fn div_signed(a: &Integer, b: &Integer) -> Integer {
     if q_mag.is_empty() {
         return Integer::new();
     }
-    Integer { limbs: q_mag, negative: a.negative ^ b.negative }
+    Integer { limbs: q_mag.into(), negative: a.negative ^ b.negative }
 }
 
 fn rem_signed(a: &Integer, b: &Integer) -> Integer {
@@ -828,7 +828,7 @@ fn rem_signed(a: &Integer, b: &Integer) -> Integer {
         return Integer::new();
     }
     // Sign of remainder matches sign of dividend (truncated division).
-    Integer { limbs: r_mag, negative: a.negative }
+    Integer { limbs: r_mag.into(), negative: a.negative }
 }
 
 // =====================================================================
@@ -966,12 +966,12 @@ fn div_rem_signed(a: &Integer, b: &Integer) -> (Integer, Integer) {
     let qi = if q.is_empty() {
         Integer::new()
     } else {
-        Integer { limbs: q, negative: false }
+        Integer { limbs: q.into(), negative: false }
     };
     let ri = if r.is_empty() {
         Integer::new()
     } else {
-        Integer { limbs: r, negative: false }
+        Integer { limbs: r.into(), negative: false }
     };
     (qi, ri)
 }
@@ -1124,7 +1124,7 @@ impl ShlAssign<u32> for Integer {
         if self.is_zero() || n == 0 {
             return;
         }
-        self.limbs = shl_mag(&self.limbs, n as u64);
+        self.limbs = shl_mag(&self.limbs, n as u64).into();
     }
 }
 
@@ -1422,8 +1422,8 @@ mod tests {
         let p = &(&dividend_q * &divisor_v) + &remainder;
         // p / v == (q, r)
         let (q_limbs, r_limbs) = super::div_rem_mag(&p.limbs, &divisor_v.limbs);
-        assert_eq!(q_limbs, dividend_q.limbs, "Knuth quotient mismatch");
-        assert_eq!(r_limbs, remainder.limbs, "Knuth remainder mismatch");
+        assert_eq!(q_limbs.as_slice(), dividend_q.limbs.as_slice(), "Knuth quotient mismatch");
+        assert_eq!(r_limbs.as_slice(), remainder.limbs.as_slice(), "Knuth remainder mismatch");
     }
 
     #[test]
@@ -1447,8 +1447,8 @@ mod tests {
         let r = Integer::from(31337_u32);
         let p = &(&q_int * &v) + &r;
         let (q_limbs, r_limbs) = super::div_rem_mag(&p.limbs, &v.limbs);
-        assert_eq!(q_limbs, q_int.limbs);
-        assert_eq!(r_limbs, r.limbs);
+        assert_eq!(q_limbs.as_slice(), q_int.limbs.as_slice());
+        assert_eq!(r_limbs.as_slice(), r.limbs.as_slice());
     }
 
     #[test]
@@ -1456,8 +1456,8 @@ mod tests {
         // Should hit the single-limb fast path, not Knuth.
         let a = Integer::parse_radix("100000000000000000000000000000", 10).unwrap();
         let (q_limbs, r_limbs) = super::div_rem_mag(&a.limbs, &[7_u64]);
-        let q = Integer { limbs: q_limbs, negative: false };
-        let r = Integer { limbs: r_limbs, negative: false };
+        let q = Integer { limbs: q_limbs.into(), negative: false };
+        let r = Integer { limbs: r_limbs.into(), negative: false };
         // 10^29 = 7q + r; verify by multiplying back.
         let recon = &(&q * &Integer::from(7_u32)) + &r;
         assert_eq!(recon, a);
@@ -1472,7 +1472,7 @@ mod tests {
         let small = Integer::from(0xFEDC_BA98_7654_3210_u64);
         let prod_via_dispatch = &big * &small;
         let prod_via_schoolbook = Integer {
-            limbs: super::mul_mag_schoolbook(&big.limbs, &small.limbs),
+            limbs: super::mul_mag_schoolbook(&big.limbs, &small.limbs).into(),
             negative: false,
         };
         assert_eq!(prod_via_dispatch, prod_via_schoolbook);
@@ -1621,14 +1621,14 @@ mod tests {
         } else {
             limbs.push(1);
         }
-        Integer { limbs, negative: false }
+        Integer { limbs: limbs.into(), negative: false }
     }
 
     fn assert_divmod_matches_knuth(a: &Integer, b: &Integer) {
         let (q_nr, r_nr) = div_rem_newton(a, b);
         let (q_k, r_k) = div_rem_mag(&a.limbs, &b.limbs);
-        let q_k = Integer { limbs: q_k, negative: false };
-        let r_k = Integer { limbs: r_k, negative: false };
+        let q_k = Integer { limbs: q_k.into(), negative: false };
+        let r_k = Integer { limbs: r_k.into(), negative: false };
         assert_eq!(q_nr.to_string_radix(16), q_k.to_string_radix(16),
             "quotient mismatch: a={} b={}", a.to_string_radix(16), b.to_string_radix(16));
         assert_eq!(r_nr.to_string_radix(16), r_k.to_string_radix(16),

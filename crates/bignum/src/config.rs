@@ -46,6 +46,15 @@ pub struct Config {
     /// fine-grained parallelism, more task overhead.
     pub parallel_to_string_threshold: usize,
     pub ntt: NttConfig,
+    /// Integer limb buffers with at least this many `u64`s are
+    /// allocated via `mmap`-backed scratch files instead of in heap
+    /// memory.  The OS page cache then handles paging between RAM
+    /// and SSD on access.  Set to `usize::MAX` (the default) to
+    /// disable disk-backing entirely — every Integer stays in
+    /// `Vec<u64>`.  Tuning down to (say) `5_000_000` pushes large
+    /// integers (~40 MB+) to disk for runs whose total live state
+    /// would exceed RAM.
+    pub disk_limb_threshold: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +71,7 @@ pub struct NttConfig {
     pub parallel_pointwise_threshold: usize,
 }
 
+
 impl Default for Config {
     /// Laptop defaults (8–16 cores).  Matches the constants the crate
     /// shipped with before runtime tuning was introduced.
@@ -74,6 +84,7 @@ impl Default for Config {
             to_string_dc_threshold: 32,
             parallel_to_string_threshold: 256,
             ntt: NttConfig::default(),
+            disk_limb_threshold: usize::MAX,
         }
     }
 }
@@ -101,6 +112,7 @@ static PARALLEL_TO_STRING_THRESHOLD: AtomicUsize = AtomicUsize::new(256);
 static NTT_TARGET_TASK_SIZE: AtomicUsize = AtomicUsize::new(1 << 16);
 static NTT_PARALLEL_PACK_THRESHOLD: AtomicUsize = AtomicUsize::new(1024);
 static NTT_PARALLEL_POINTWISE_THRESHOLD: AtomicUsize = AtomicUsize::new(1024);
+static DISK_LIMB_THRESHOLD: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// Push a [`Config`] into the live atomics.  Call this once at
 /// program startup, before any compute path runs.  Repeat calls just
@@ -119,6 +131,7 @@ pub fn apply(c: &Config) {
         .store(c.ntt.parallel_pack_threshold, Ordering::Relaxed);
     NTT_PARALLEL_POINTWISE_THRESHOLD
         .store(c.ntt.parallel_pointwise_threshold, Ordering::Relaxed);
+    DISK_LIMB_THRESHOLD.store(c.disk_limb_threshold, Ordering::Relaxed);
 }
 
 /// Snapshot the currently-applied configuration by reading the live
@@ -143,8 +156,14 @@ impl Config {
                 parallel_pointwise_threshold: NTT_PARALLEL_POINTWISE_THRESHOLD
                     .load(Ordering::Relaxed),
             },
+            disk_limb_threshold: DISK_LIMB_THRESHOLD.load(Ordering::Relaxed),
         }
     }
+}
+
+#[inline]
+pub(crate) fn disk_limb_threshold() -> usize {
+    DISK_LIMB_THRESHOLD.load(Ordering::Relaxed)
 }
 
 // =====================================================================
