@@ -32,6 +32,10 @@
 //! the top of the recursion, so the dominant cost is a single GMP
 //! multiplication of two `D`-digit numbers — O(M(D) · log D) total.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::Result;
 use bignum::{Float, Integer, Pow};
 
@@ -139,19 +143,58 @@ impl PiAlgorithm for Chudnovsky {
 ///
 /// The top-level caller invokes this with `a = 1`, so `M_{a-1} = M_0 = 1`
 /// and the partial sum is exactly `T / Q`.
+///
+/// Progress: the parallel work runs on a worker thread (which dispatches
+/// to the rayon pool internally), while this function polls a shared
+/// atomic and emits ticks on behalf of completed merges.  Each merge
+/// contributes a Karatsuba-weighted share of the total, so the bar
+/// reflects real wall-time progress — fast early as small subtrees
+/// finish, slowing into the few enormous root-level merges.
 fn binary_split(
     a: u64,
     b: u64,
     progress: &mut dyn ProgressReporter,
 ) -> (Integer, Integer, Integer) {
-    let result = binary_split_pure(a, b);
-    // Ticks happen at leaves; with parallel execution we can't easily
-    // ferry per-leaf progress out of the rayon scope.  Batch the tick
-    // count: bar stays empty during the parallel section, then jumps
-    // to 100% when this returns.  Acceptable trade for the speedup —
-    // binary-split is no longer the slow phase anyway.
-    for _ in a..b {
+    let n_terms = b - a;
+    let total_weight = total_merge_weight(a, b).max(1);
+    let done_weight = Arc::new(AtomicU64::new(0));
+    let finished = Arc::new(AtomicBool::new(false));
+
+    let worker = {
+        let done_weight = Arc::clone(&done_weight);
+        let finished = Arc::clone(&finished);
+        std::thread::spawn(move || {
+            let result = binary_split_pure(a, b, &done_weight);
+            // Release: every fetch_add above happens-before this store,
+            // so a reader that sees `finished == true` via Acquire is
+            // guaranteed to see every weight contribution as well.
+            finished.store(true, Ordering::Release);
+            result
+        })
+    };
+
+    let mut ticks_emitted: u64 = 0;
+    loop {
+        let done = done_weight.load(Ordering::Relaxed);
+        let target = (((done as u128) * (n_terms as u128)) / total_weight as u128) as u64;
+        let target = target.min(n_terms);
+        while ticks_emitted < target {
+            progress.tick();
+            ticks_emitted += 1;
+        }
+        if finished.load(Ordering::Acquire) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let result = worker.join().expect("binary_split worker panicked");
+    // Guarantee the bar reaches 100% even if the weight model under-
+    // counted by a unit somewhere (rounding) or a few merges finished
+    // after the last poll.
+    while ticks_emitted < n_terms {
         progress.tick();
+        ticks_emitted += 1;
     }
     result
 }
@@ -162,10 +205,33 @@ fn binary_split(
 /// per-task overhead.  64 ≈ 6 levels of doubling above the leaves.
 const PARALLEL_SPLIT_THRESHOLD: u64 = 64;
 
-/// Pure (no-progress, `Send`-safe) variant of binary splitting.  Spawns
-/// `rayon::join` for the two recursive calls once the range is large
-/// enough that the rayon task overhead is amortized.
-fn binary_split_pure(a: u64, b: u64) -> (Integer, Integer, Integer) {
+/// Karatsuba-aware cost estimate for one merge over `n` terms.
+///
+/// A merge over `n` terms multiplies two integers of size ~n/2 limbs, and
+/// Karatsuba costs ~size^log₂3 ≈ size^1.585.  The constant factor is
+/// irrelevant for the progress ratio; only the scaling matters.
+fn merge_weight(n: u64) -> u64 {
+    ((n as f64).powf(1.585)).max(1.0) as u64
+}
+
+/// Sum of `merge_weight` across every internal node of the splitting
+/// tree for `[a, b)`.  Leaves contribute zero — their work is dominated
+/// by even the smallest merge above them.
+fn total_merge_weight(a: u64, b: u64) -> u64 {
+    if b - a <= 1 {
+        return 0;
+    }
+    let m = (a + b) / 2;
+    merge_weight(b - a) + total_merge_weight(a, m) + total_merge_weight(m, b)
+}
+
+/// Pure (no-progress-callback, `Send`-safe) variant of binary splitting.
+/// Spawns `rayon::join` for the two recursive calls once the range is
+/// large enough that the rayon task overhead is amortized.  Each merge
+/// publishes its Karatsuba-weighted share to `done_weight` so the
+/// monitor in `binary_split` can render a smooth progress bar without
+/// any per-merge synchronization cost beyond one relaxed `fetch_add`.
+fn binary_split_pure(a: u64, b: u64, done_weight: &AtomicU64) -> (Integer, Integer, Integer) {
     debug_assert!(a < b, "binary_split called with empty/reversed range [{a}, {b})");
     if b - a == 1 {
         let k = Integer::from(a);
@@ -186,17 +252,21 @@ fn binary_split_pure(a: u64, b: u64) -> (Integer, Integer, Integer) {
         let m = (a + b) / 2;
         let ((p_l, q_l, t_l), (p_r, q_r, t_r)) = if b - a >= PARALLEL_SPLIT_THRESHOLD {
             rayon::join(
-                || binary_split_pure(a, m),
-                || binary_split_pure(m, b),
+                || binary_split_pure(a, m, done_weight),
+                || binary_split_pure(m, b, done_weight),
             )
         } else {
-            (binary_split_pure(a, m), binary_split_pure(m, b))
+            (
+                binary_split_pure(a, m, done_weight),
+                binary_split_pure(m, b, done_weight),
+            )
         };
         // Combine.  Order matters: we need to use `&q_r` and `&p_l` to
         // build `t` before consuming them in `p` and `q`.
         let t = t_l * &q_r + &p_l * t_r;
         let p = p_l * p_r;
         let q = q_l * q_r;
+        done_weight.fetch_add(merge_weight(b - a), Ordering::Relaxed);
         (p, q, t)
     }
 }
