@@ -438,13 +438,26 @@ fn sub_signed(a: &Integer, b: &Integer) -> Integer {
 /// on x86-64 is in the same neighborhood (~28 limbs).
 const KARATSUBA_THRESHOLD: usize = 32;
 
-/// Dispatch: pick schoolbook for small operands, Karatsuba for large.
-/// The cross-over is set by [`KARATSUBA_THRESHOLD`].
+/// Operand size (in limbs) at which Goldilocks NTT multiplication
+/// outruns Karatsuba.  Karatsuba is `O(N^1.585)`, NTT is `O(N log N)`
+/// but with a large constant from forward/inverse transforms.  The
+/// crossover lives somewhere in the low thousands of limbs on this
+/// hardware; we'll tune after measuring.  Both operands must exceed
+/// this size before NTT is selected, since the cost is governed by
+/// the *larger* operand (the transform length is set by `n_a + n_b`).
+const NTT_THRESHOLD: usize = 8192;
+
+/// Dispatch: NTT for very large operands, Karatsuba for medium,
+/// schoolbook for small.  See [`NTT_THRESHOLD`] and
+/// [`KARATSUBA_THRESHOLD`].
 fn mul_mag(a: &[u64], b: &[u64]) -> Vec<u64> {
     if a.is_empty() || b.is_empty() {
         return Vec::new();
     }
-    if a.len().min(b.len()) < KARATSUBA_THRESHOLD {
+    let smaller = a.len().min(b.len());
+    if smaller >= NTT_THRESHOLD {
+        crate::ntt::mul_mag_ntt(a, b)
+    } else if smaller < KARATSUBA_THRESHOLD {
         mul_mag_schoolbook(a, b)
     } else {
         mul_mag_karatsuba(a, b)

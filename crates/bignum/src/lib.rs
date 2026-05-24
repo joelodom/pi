@@ -11,6 +11,7 @@
 
 pub mod float;
 pub mod integer;
+pub(crate) mod ntt;
 
 pub use float::Float;
 pub use integer::Integer;
