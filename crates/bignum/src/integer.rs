@@ -176,7 +176,7 @@ impl Integer {
                     out.push_str(&format!("{:016x}", mag.limbs[i]));
                 }
             }
-            10 => to_decimal_top(&mag, &mut out),
+            10 => out.push_str(&to_decimal_top(&mag)),
             _ => panic!("unsupported radix {radix} in to_string_radix"),
         }
         out
@@ -859,13 +859,23 @@ const TO_STRING_DC_THRESHOLD: usize = 32;
 const DECIMAL_CHUNK_DIGITS: u32 = 19;
 const DECIMAL_CHUNK: u64 = 10_000_000_000_000_000_000;
 
-/// Top-level entry: append `n` (which must be `≥ 0` and nonzero) to
-/// `out` with no leading zeros.
-fn to_decimal_top(n: &Integer, out: &mut String) {
+/// Above this subtree limb-count, the D&C base-conversion recursion
+/// forks the hi/lo branches onto separate rayon worker threads.  The
+/// branches are completely independent — each does its own division
+/// against `10^m` and writes into its own String, then the parent
+/// concatenates the two.  Below this threshold the per-branch work is
+/// small enough that `rayon::join` task overhead would dominate, so
+/// the recursion stays sequential.
+const PARALLEL_TO_STRING_THRESHOLD: usize = 256;
+
+/// Top-level entry: render `n` (which must be `≥ 0` and nonzero) as a
+/// decimal String with no leading zeros.
+fn to_decimal_top(n: &Integer) -> String {
     debug_assert!(!n.is_zero() && !n.negative);
     if n.limbs.len() <= TO_STRING_DC_THRESHOLD {
-        write_decimal_naive(n, out);
-        return;
+        let mut out = String::new();
+        write_decimal_naive(n, &mut out);
+        return out;
     }
     // Estimate decimal digit count from bit length: D ≈ bits · log₁₀ 2.
     // The estimate may be off by 1 either way, but our recursion is
@@ -876,42 +886,58 @@ fn to_decimal_top(n: &Integer, out: &mut String) {
     let est_digits = decimal_digits_estimate(n.bits());
     let m = est_digits / 2;
     if m == 0 {
-        write_decimal_naive(n, out);
-        return;
+        let mut out = String::new();
+        write_decimal_naive(n, &mut out);
+        return out;
     }
     let splitter = Integer::u_pow_u(10, m);
     let (hi, lo) = div_rem_signed(n, &splitter);
     // Hi: just emit it (no padding — caller wants the natural-length
-    // top half).
-    to_decimal_top(&hi, out);
-    // Lo: must contribute exactly `m` characters.
-    to_decimal_padded(&lo, m as usize, out);
+    // top half).  Lo: exactly `m` characters.
+    let (mut hi_str, lo_str) = if n.limbs.len() >= PARALLEL_TO_STRING_THRESHOLD {
+        rayon::join(
+            || to_decimal_top(&hi),
+            || to_decimal_padded(&lo, m as usize),
+        )
+    } else {
+        (to_decimal_top(&hi), to_decimal_padded(&lo, m as usize))
+    };
+    hi_str.reserve(lo_str.len());
+    hi_str.push_str(&lo_str);
+    hi_str
 }
 
-/// Append exactly `want_len` decimal characters representing `n`,
-/// padding with leading zeros if needed.  Precondition: `n < 10^want_len`.
-fn to_decimal_padded(n: &Integer, want_len: usize, out: &mut String) {
+/// Render `n` as exactly `want_len` decimal characters, padding with
+/// leading zeros if needed.  Precondition: `n < 10^want_len`.
+fn to_decimal_padded(n: &Integer, want_len: usize) -> String {
     if n.is_zero() {
-        for _ in 0..want_len {
-            out.push('0');
-        }
-        return;
+        return "0".repeat(want_len);
     }
     if n.limbs.len() <= TO_STRING_DC_THRESHOLD {
         let mut buf = String::new();
         write_decimal_naive(n, &mut buf);
         debug_assert!(buf.len() <= want_len, "padded leaf overflowed want_len");
+        let mut out = String::with_capacity(want_len);
         for _ in buf.len()..want_len {
             out.push('0');
         }
         out.push_str(&buf);
-        return;
+        return out;
     }
     let m = want_len / 2;
     let splitter = Integer::u_pow_u(10, m as u32);
     let (hi, lo) = div_rem_signed(n, &splitter);
-    to_decimal_padded(&hi, want_len - m, out);
-    to_decimal_padded(&lo, m, out);
+    let (mut hi_str, lo_str) = if n.limbs.len() >= PARALLEL_TO_STRING_THRESHOLD {
+        rayon::join(
+            || to_decimal_padded(&hi, want_len - m),
+            || to_decimal_padded(&lo, m),
+        )
+    } else {
+        (to_decimal_padded(&hi, want_len - m), to_decimal_padded(&lo, m))
+    };
+    hi_str.reserve(lo_str.len());
+    hi_str.push_str(&lo_str);
+    hi_str
 }
 
 /// Existing peel-by-10^19 loop — used as the D&C base case once the
