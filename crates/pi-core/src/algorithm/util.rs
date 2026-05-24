@@ -1,53 +1,13 @@
 //! Shared low-level helpers used by every algorithm in this module.
 //!
 //! Lives here, not inside any single algorithm file, because both
-//! Chudnovsky and Gauss-Legendre (and any future algorithm) need to
-//! widen MPFR's exponent range before they start producing huge
-//! intermediate magnitudes, and both convert the same final `Float` pi
-//! value into a stream of decimal digits.
+//! Chudnovsky and Gauss-Legendre (and any future algorithm) convert
+//! the same final `Float` pi value into a stream of decimal digits.
 
-use anyhow::{anyhow, bail, Result};
-use rug::float::Round;
-use rug::ops::PowAssign;
-use rug::{Float, Integer};
+use anyhow::{anyhow, Result};
+use bignum::{Float, Integer, PowAssign, Round};
 
 use crate::output::DigitSink;
-
-/// Push MPFR's allowed exponent range out to its hardware maximum so
-/// the O(10^D)-magnitude intermediates inside the algorithms don't
-/// trigger silent overflow to +∞.  The change is process-global, but a
-/// widened range is harmless for any Float with a small magnitude.
-pub(super) fn widen_mpfr_exponent_range_for(digits: u64) -> Result<()> {
-    use gmp_mpfr_sys::mpfr;
-    use std::f64::consts::LOG2_10;
-
-    // Conservative estimate of the largest binary exponent we'll need:
-    // log2(10) · D, plus generous margin for intermediate products.
-    let needed_exp = (digits as f64 * LOG2_10).ceil() as i128 + 1024;
-
-    // Safety: every gmp_mpfr_sys call here only reads or writes MPFR's
-    // global emin/emax through the documented MPFR API.  None of them
-    // dereferences any pointer we hand in.
-    unsafe {
-        let emax_max = mpfr::get_emax_max();
-        let emin_min = mpfr::get_emin_min();
-        if needed_exp > emax_max as i128 {
-            bail!(
-                "{} digits requires an MPFR exponent up to {}, exceeding the platform cap ({})",
-                digits,
-                needed_exp,
-                emax_max
-            );
-        }
-        if mpfr::set_emax(emax_max) != 0 {
-            bail!("failed to widen MPFR emax to {}", emax_max);
-        }
-        if mpfr::set_emin(emin_min) != 0 {
-            bail!("failed to widen MPFR emin to {}", emin_min);
-        }
-    }
-    Ok(())
-}
 
 /// Render `pi` to exactly `digits` decimal digits (counting the leading
 /// `3`) and stream them through `sink`.

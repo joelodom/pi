@@ -63,7 +63,7 @@ impl PrecisionPlan {
         // stays well inside f64's exponent range too.
         let precision_bits = (digits as f64 * LOG2_10).ceil() as u64 + SAFETY_BITS;
 
-        let mpfr_cap = rug::float::prec_max_64();
+        let mpfr_cap = bignum::float::prec_max_64();
         if precision_bits > mpfr_cap {
             bail!(
                 "{} digits requires {} bits of working precision, which exceeds MPFR's cap ({})",

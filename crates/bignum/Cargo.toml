@@ -1,0 +1,9 @@
+[package]
+name = "bignum"
+description = "Pure-Rust arbitrary-precision Integer and Float used as a proof-of-concept replacement for rug/GMP/MPFR."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]

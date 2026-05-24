@@ -31,13 +31,13 @@
 //! cannot survive a byte-by-byte agreement on D digits with the other.
 
 use anyhow::Result;
-use rug::{Assign, Float, Integer};
+use bignum::{Float, Integer};
 
 use crate::output::DigitSink;
 use crate::precision::PrecisionPlan;
 use crate::progress::{Phase, ProgressReporter};
 
-use super::util::{widen_mpfr_exponent_range_for, write_decimal_digits};
+use super::util::write_decimal_digits;
 use super::PiAlgorithm;
 
 const PHASE_INIT: &str = "initialization";
@@ -70,7 +70,6 @@ impl PiAlgorithm for GaussLegendre {
         }
 
         let plan = PrecisionPlan::for_digits(digits)?;
-        widen_mpfr_exponent_range_for(digits)?;
 
         // Iterations needed to reach `precision_bits` correct binary
         // digits, given quadratic convergence (one bit at iteration 0

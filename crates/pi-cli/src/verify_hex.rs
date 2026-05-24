@@ -31,7 +31,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rand::rngs::OsRng;
 use rand::Rng;
 use rayon::prelude::*;
-use rug::{Assign, Integer};
+use bignum::Integer;
 
 use pi_core::bbp;
 

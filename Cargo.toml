@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/pi-core", "crates/pi-cli"]
+members = ["crates/bignum", "crates/pi-core", "crates/pi-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,14 +10,13 @@ repository = ""
 
 [workspace.dependencies]
 pi-core = { path = "crates/pi-core" }
+bignum = { path = "crates/bignum" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3.4"
-gmp-mpfr-sys = { version = "1.7", default-features = false, features = ["mpfr"] }
 indicatif = "0.17"
 rand = "0.8"
 rayon = "1.10"
-rug = { version = "1.24", default-features = false, features = ["integer", "float", "std"] }
 
 # Release profile tuned for the long-running compute path.  LTO is worth a
 # few percent on GMP-heavy workloads, and a single codegen unit lets the

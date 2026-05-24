@@ -33,14 +33,13 @@
 //! multiplication of two `D`-digit numbers — O(M(D) · log D) total.
 
 use anyhow::Result;
-use rug::ops::Pow;
-use rug::{Float, Integer};
+use bignum::{Float, Integer, Pow};
 
 use crate::output::DigitSink;
 use crate::precision::PrecisionPlan;
 use crate::progress::{Phase, ProgressReporter};
 
-use super::util::{widen_mpfr_exponent_range_for, write_decimal_digits};
+use super::util::write_decimal_digits;
 use super::PiAlgorithm;
 
 /// Decimal digits added per Chudnovsky term (≈ log10(C³ / 24) / 3).
@@ -81,7 +80,6 @@ impl PiAlgorithm for Chudnovsky {
         }
 
         let plan = PrecisionPlan::for_digits(digits)?;
-        widen_mpfr_exponent_range_for(digits)?;
 
         // Number of binary-splitting terms.  Each Chudnovsky term
         // contributes `DIGITS_PER_TERM` digits; round up and add a
