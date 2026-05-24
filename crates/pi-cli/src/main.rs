@@ -12,6 +12,8 @@
 //!
 //! Running `pi` with no arguments prints the help text.
 
+mod config_gen;
+mod hardware;
 mod verify_hex;
 
 use std::collections::HashMap;
@@ -77,6 +79,14 @@ struct Cli {
     /// for examples and per-knob documentation.
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
+
+    /// Emit a hardware-tuned TOML config for the given digit count and
+    /// the current host, then exit.  Output goes to stdout; redirect
+    /// or `tee` it to a file.  Sets every knob with a comment
+    /// explaining why that value was chosen.  No pi computation is
+    /// performed.
+    #[arg(long, value_name = "DIGITS")]
+    generate_config: Option<u64>,
 
     /// Verify two digit files against each other instead of computing.
     /// Trims trailing whitespace on both, then byte-by-byte compares the
@@ -273,6 +283,16 @@ fn load_and_apply_config(path: Option<&Path>) -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // --generate-config short-circuits the rest of the program — no
+    // pi computation, no config loading.  Detect hardware, emit TOML,
+    // exit.
+    if let Some(digits) = cli.generate_config {
+        let hw = hardware::detect();
+        let toml = config_gen::generate(digits, &hw);
+        print!("{toml}");
+        return Ok(());
+    }
 
     // Load and apply the perf config (or defaults).  This MUST run
     // before any rayon work — if the config requests a specific

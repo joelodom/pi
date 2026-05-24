@@ -17,6 +17,7 @@ bignum.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 indicatif.workspace = true
+libc.workspace = true
 rand.workspace = true
 rayon.workspace = true
 serde.workspace = true
