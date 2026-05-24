@@ -22,5 +22,11 @@ target
 
 *.txt
 
+# samply profiler output (gecko-format profile + symbol sidecars)
+profile.json.gz
+*.profile.json.gz
+*.profile.json.syms.json
+*.symbolicated.json
+
 .claude/
 .mcp.json
