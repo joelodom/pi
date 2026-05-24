@@ -28,10 +28,12 @@
 pub mod algorithm;
 pub mod bbp;
 pub mod output;
+pub mod perf;
 pub mod precision;
 pub mod progress;
 
 pub use algorithm::{AlgorithmKind, PiAlgorithm};
 pub use output::DigitSink;
+pub use perf::{PerfRecorder, SamplerGuard};
 pub use precision::PrecisionPlan;
 pub use progress::{NoopProgress, Phase, ProgressReporter};

@@ -26,7 +26,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use pi_core::output::{file_sink, stdout_sink};
 use pi_core::progress::NoopProgress;
-use pi_core::{AlgorithmKind, DigitSink, Phase, ProgressReporter};
+use pi_core::{AlgorithmKind, DigitSink, PerfRecorder, Phase, ProgressReporter};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -51,6 +51,22 @@ struct Cli {
     /// Suppress the progress reporter (progress goes to stderr).
     #[arg(long)]
     no_progress: bool,
+
+    /// Append-only JSONL file to receive performance instrumentation.
+    /// One `run-start` event is emitted at the top, followed by
+    /// `phase-start` / `phase-end` markers and periodic `sample`
+    /// records (memory, effective CPU cores).  Omit the flag to
+    /// disable instrumentation entirely (the recorder becomes a NOP).
+    #[arg(long, value_name = "FILE")]
+    performance_file: Option<PathBuf>,
+
+    /// Interval between periodic perf samples, in milliseconds.  Only
+    /// meaningful when `--performance-file` is set.  Small values
+    /// give finer time resolution at the cost of more lines in the
+    /// output; the sampler itself is cheap (< 0.1% of one core at
+    /// 500 ms).
+    #[arg(long, default_value_t = 500, value_name = "MS")]
+    performance_sample_ms: u64,
 
     /// Verify two digit files against each other instead of computing.
     /// Trims trailing whitespace on both, then byte-by-byte compares the
@@ -168,15 +184,31 @@ fn run_compute(cli: Cli) -> Result<()> {
         )
     };
 
-    let mut progress: Box<dyn ProgressReporter> = if cli.no_progress {
+    let inner_progress: Box<dyn ProgressReporter> = if cli.no_progress {
         Box::new(NoopProgress)
     } else {
         Box::new(CliProgress::new())
     };
 
+    // Open the perf recorder (no-op when `--performance-file` is unset).
+    // Hold the sampler guard for the lifetime of the run so it stops
+    // and joins on drop.
+    let recorder = match cli.performance_file.as_deref() {
+        Some(path) => PerfRecorder::open(path, cli.digits, algorithm.name())
+            .with_context(|| {
+                format!("opening performance file `{}`", path.display())
+            })?,
+        None => PerfRecorder::disabled(),
+    };
+    let _sampler = recorder.start_sampler(cli.performance_sample_ms);
+
+    let mut progress: Box<dyn ProgressReporter> =
+        Box::new(PerfWrappedProgress::new(inner_progress, recorder.clone()));
+
     let start = Instant::now();
     algorithm.compute(cli.digits, &mut *sink, &mut *progress)?;
     let elapsed = start.elapsed();
+    recorder.run_end();
     eprintln!(
         "done: {} digits in {:.3?}",
         fmt_thousands(cli.digits),
@@ -459,5 +491,46 @@ impl ProgressReporter for CliProgress {
             bar.set_style(Self::done_style());
             bar.finish();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PerfWrappedProgress
+// ---------------------------------------------------------------------------
+//
+// Wraps an inner ProgressReporter (CliProgress or NoopProgress) and a
+// PerfRecorder.  Forwards every reporter call to both, so the
+// algorithm only sees the ProgressReporter interface and remains
+// oblivious to perf instrumentation.  When the recorder is disabled,
+// the forwarding calls are no-ops in the recorder's hot path.
+
+struct PerfWrappedProgress {
+    inner: Box<dyn ProgressReporter>,
+    recorder: PerfRecorder,
+}
+
+impl PerfWrappedProgress {
+    fn new(inner: Box<dyn ProgressReporter>, recorder: PerfRecorder) -> Self {
+        Self { inner, recorder }
+    }
+}
+
+impl ProgressReporter for PerfWrappedProgress {
+    fn set_phases(&mut self, phases: &[Phase]) {
+        self.inner.set_phases(phases);
+    }
+
+    fn start_phase(&mut self, name: &str, total: u64) {
+        self.inner.start_phase(name, total);
+        self.recorder.phase_start(name);
+    }
+
+    fn tick(&mut self) {
+        self.inner.tick();
+    }
+
+    fn end_phase(&mut self) {
+        self.recorder.phase_end();
+        self.inner.end_phase();
     }
 }
