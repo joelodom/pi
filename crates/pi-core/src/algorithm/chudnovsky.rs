@@ -144,13 +144,33 @@ fn binary_split(
     b: u64,
     progress: &mut dyn ProgressReporter,
 ) -> (Integer, Integer, Integer) {
+    let result = binary_split_pure(a, b);
+    // Ticks happen at leaves; with parallel execution we can't easily
+    // ferry per-leaf progress out of the rayon scope.  Batch the tick
+    // count: bar stays empty during the parallel section, then jumps
+    // to 100% when this returns.  Acceptable trade for the speedup —
+    // binary-split is no longer the slow phase anyway.
+    for _ in a..b {
+        progress.tick();
+    }
+    result
+}
+
+/// Subtree sizes below this run sequentially.  Above it, the two halves
+/// of the range are forked via `rayon::join` so the recursion exposes
+/// parallelism at every level until the granularity shrinks below the
+/// per-task overhead.  64 ≈ 6 levels of doubling above the leaves.
+const PARALLEL_SPLIT_THRESHOLD: u64 = 64;
+
+/// Pure (no-progress, `Send`-safe) variant of binary splitting.  Spawns
+/// `rayon::join` for the two recursive calls once the range is large
+/// enough that the rayon task overhead is amortized.
+fn binary_split_pure(a: u64, b: u64) -> (Integer, Integer, Integer) {
     debug_assert!(a < b, "binary_split called with empty/reversed range [{a}, {b})");
     if b - a == 1 {
         let k = Integer::from(a);
         let six_k = Integer::from(&k * 6_u32);
-        // p_k = -(6k - 5)(6k - 1)(2k - 1).  Literal suffixes are needed
-        // because `rug` provides `Sub<T> for &Integer` for many primitive T
-        // and the inference can't pick one without a hint.
+        // p_k = -(6k - 5)(6k - 1)(2k - 1).
         let factor1: Integer = Integer::from(&six_k - 5_u32);
         let factor2: Integer = Integer::from(&six_k - 1_u32);
         let factor3: Integer = Integer::from(&k * 2_u32) - 1_u32;
@@ -161,12 +181,17 @@ fn binary_split(
         // t_k = p_k · (A + B·k)
         let l: Integer = Integer::from(A) + Integer::from(&k * B);
         let t: Integer = Integer::from(&p * &l);
-        progress.tick();
         (p, q, t)
     } else {
         let m = (a + b) / 2;
-        let (p_l, q_l, t_l) = binary_split(a, m, progress);
-        let (p_r, q_r, t_r) = binary_split(m, b, progress);
+        let ((p_l, q_l, t_l), (p_r, q_r, t_r)) = if b - a >= PARALLEL_SPLIT_THRESHOLD {
+            rayon::join(
+                || binary_split_pure(a, m),
+                || binary_split_pure(m, b),
+            )
+        } else {
+            (binary_split_pure(a, m), binary_split_pure(m, b))
+        };
         // Combine.  Order matters: we need to use `&q_r` and `&p_l` to
         // build `t` before consuming them in `p` and `q`.
         let t = t_l * &q_r + &p_l * t_r;

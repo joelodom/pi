@@ -9,3 +9,4 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 bignum.workspace = true
+rayon.workspace = true

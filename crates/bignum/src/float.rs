@@ -143,13 +143,10 @@ impl Float {
         loop {
             current_prec = (current_prec * 2).min(target_prec + 16);
 
-            // Truncate N to current_prec for the division.
-            let n_at_prec = {
-                let mut tmp = self.clone();
-                tmp.prec = current_prec;
-                tmp.round_to_prec();
-                tmp
-            };
+            // Truncate N to current_prec for the division — only the
+            // top ~current_prec/64 limbs are copied, not the full
+            // target-precision mantissa.
+            let n_at_prec = self.truncated_to_prec(current_prec);
             // Bring x up to the new working precision (its information
             // content is unchanged; we're just relabeling the slot it
             // occupies so the next division produces a wider result).
@@ -449,12 +446,7 @@ impl Float {
             // in `sqrt_mut`: otherwise the multiplication operates on
             // the full original mantissa and reintroduces the cost we
             // were trying to dodge.
-            let b_at_prec = {
-                let mut tmp = mag.clone();
-                tmp.prec = current_prec;
-                tmp.round_to_prec();
-                tmp
-            };
+            let b_at_prec = mag.truncated_to_prec(current_prec);
             x.prec = current_prec;
             x.round_to_prec();
 
@@ -479,6 +471,50 @@ impl Float {
         x.round_to_prec();
         x.sign = self.sign;
         x
+    }
+
+    /// Return a copy of `self` whose mantissa holds at most `prec`
+    /// bits.  Functionally equivalent to
+    /// `{ let mut t = self.clone(); t.prec = prec; t.round_to_prec(); t }`,
+    /// but avoids cloning the full mantissa Vec when `self` is much
+    /// larger than `prec` — only the top ~prec/64 limbs are copied.
+    ///
+    /// Used in the Newton iters of `sqrt_mut` / `reciprocal_at_prec`,
+    /// where every iteration needs a `prec`-truncated view of an
+    /// operand whose mantissa is target-precision (much larger).
+    pub(crate) fn truncated_to_prec(&self, prec: u64) -> Float {
+        if self.mantissa.is_zero() {
+            return Float { prec, sign: false, mantissa: Integer::new(), exp: 0 };
+        }
+        let mantissa_bits = self.mantissa.bits();
+        if mantissa_bits <= prec {
+            // Already small enough — just clone and relabel the prec.
+            let mut out = self.clone();
+            out.prec = prec;
+            return out;
+        }
+        // Keep enough limbs to hold `prec + 1` bits so `round_to_prec`
+        // can examine the round bit just below the cut.  Mantissa is
+        // little-endian, so we drop low limbs and keep the high ones.
+        let keep_limbs = ((prec + 64) / 64) as usize + 1;
+        let total_limbs = self.mantissa.limbs.len();
+        if keep_limbs >= total_limbs {
+            // Nothing meaningful to trim — fall back to the simple path.
+            let mut out = self.clone();
+            out.prec = prec;
+            out.round_to_prec();
+            return out;
+        }
+        let drop_limbs = total_limbs - keep_limbs;
+        let new_limbs: Vec<u64> = self.mantissa.limbs[drop_limbs..].to_vec();
+        let mut out = Float {
+            prec,
+            sign: self.sign,
+            mantissa: Integer { limbs: new_limbs, negative: self.mantissa.negative },
+            exp: self.exp + (drop_limbs as i64) * 64,
+        };
+        out.round_to_prec();
+        out
     }
 
     /// Normalize: ensure mantissa has at most `prec` bits, rounding

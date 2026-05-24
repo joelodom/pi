@@ -483,6 +483,17 @@ fn mul_mag_schoolbook(a: &[u64], b: &[u64]) -> Vec<u64> {
     out
 }
 
+/// Subproblems at or above this size (in limbs of the smaller operand)
+/// get their three Karatsuba sub-multiplications dispatched to rayon
+/// via nested `join`.  Below the threshold the sub-mults are still
+/// pure Karatsuba (down to the schoolbook leaves) but run sequentially
+/// — rayon's task overhead would otherwise eat any saving.
+///
+/// 512 limbs ≈ 32K bits ≈ 10K decimal digits.  At top-level mults of
+/// 80K+ limbs this gives us several levels of 3-way parallelism before
+/// switching back to sequential.
+const PARALLEL_KARATSUBA_THRESHOLD: usize = 512;
+
 /// Karatsuba multiplication on magnitudes — O(N^log₂3) ≈ O(N^1.585).
 ///
 /// Splits each operand into high and low halves at the same limb
@@ -499,6 +510,12 @@ fn mul_mag_schoolbook(a: &[u64], b: &[u64]) -> Vec<u64> {
 /// where `B = 2^64` is the limb base and `m` is the split point in
 /// limbs.  The three subproducts (z0, z2, z1_prod) recurse through the
 /// dispatcher, so the base case is schoolbook on small slices.
+///
+/// At top recursion levels (operands ≥ `PARALLEL_KARATSUBA_THRESHOLD`)
+/// the three sub-mults are independent and we run them in parallel via
+/// nested `rayon::join`.  Each level of the recursion that meets the
+/// threshold gets 3× parallelism, so a few levels deep we have plenty
+/// of work for any reasonable core count.
 fn mul_mag_karatsuba(a: &[u64], b: &[u64]) -> Vec<u64> {
     // Split point: half of the longer operand, in limbs.
     let n = a.len().max(b.len());
@@ -510,14 +527,37 @@ fn mul_mag_karatsuba(a: &[u64], b: &[u64]) -> Vec<u64> {
     let (a_lo, a_hi) = a.split_at(m.min(a.len()));
     let (b_lo, b_hi) = b.split_at(m.min(b.len()));
 
-    // z0 = a_lo · b_lo  (low × low)
-    let z0 = mul_mag(a_lo, b_lo);
-    // z2 = a_hi · b_hi  (high × high; may be empty if either hi is empty)
-    let z2 = mul_mag(a_hi, b_hi);
-    // z1_prod = (a_lo + a_hi) · (b_lo + b_hi)
-    let a_sum = add_mag(a_lo, a_hi);
-    let b_sum = add_mag(b_lo, b_hi);
-    let z1_prod = mul_mag(&a_sum, &b_sum);
+    // The three sub-mults are independent and dominate the cost.  At
+    // large sizes, dispatch them across rayon worker threads.
+    let go_parallel = a.len().min(b.len()) >= PARALLEL_KARATSUBA_THRESHOLD;
+
+    let (z0, z2, z1_prod) = if go_parallel {
+        // Pre-compute the addends so they can be moved into the rayon
+        // closures (which need 'static lifetimes via owned data).
+        let a_sum = add_mag(a_lo, a_hi);
+        let b_sum = add_mag(b_lo, b_hi);
+        // Three-way fork: rayon::join is 2-way, so nest once.  The
+        // outermost call gives us `z0` in parallel with `(z2, z1_prod)`
+        // which itself is `z2` in parallel with `z1_prod`.
+        let (z0, (z2, z1_prod)) = rayon::join(
+            || mul_mag(a_lo, b_lo),
+            || {
+                rayon::join(
+                    || mul_mag(a_hi, b_hi),
+                    || mul_mag(&a_sum, &b_sum),
+                )
+            },
+        );
+        (z0, z2, z1_prod)
+    } else {
+        let z0 = mul_mag(a_lo, b_lo);
+        let z2 = mul_mag(a_hi, b_hi);
+        let a_sum = add_mag(a_lo, a_hi);
+        let b_sum = add_mag(b_lo, b_hi);
+        let z1_prod = mul_mag(&a_sum, &b_sum);
+        (z0, z2, z1_prod)
+    };
+
     // z1 = z1_prod − z0 − z2  (the cross terms; always ≥ 0)
     let z0_plus_z2 = add_mag(&z0, &z2);
     let z1 = sub_mag(&z1_prod, &z0_plus_z2);
