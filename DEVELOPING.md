@@ -120,6 +120,26 @@ more.
   allows multiple `write_fractional_digits` calls, so the contract
   already permits this — only the caller (`write_decimal_digits`)
   needs to be reworked.
+- **Chunked binary splitting across machines.** Binary splitting is
+  naturally decomposable: `binary_split(a, b)` returns a triple
+  `(P, Q, T)` that the parent combines using only the sibling triple,
+  not its internals. So the term range can be split into N chunks
+  computed independently on small instances, then combined on one
+  big-RAM instance. For a 100B run this means the 70% of wall time
+  that lives in the lower/middle tree levels can run on $0.85/hr
+  hardware instead of $10–30/hr hardware; the big instance only
+  needs to live long enough to do the top few combines and the final
+  assembly. It still needs ~700 GB RAM (both half-sized triples are
+  live during the top combine), so this shortens how long you rent
+  the big machine, not whether you rent one. Work involved: a fast
+  binary serialization for `rug::Integer` (probably via the raw
+  `mpz_out_raw` / `mpz_inp_raw` FFI from `gmp-mpfr-sys`), a
+  `--chunk N/M` mode that writes its triple to disk, a `--combine`
+  mode that loads triples and does upper-tree work, plus a transport
+  story (S3 is the easy answer). Roughly a week of focused work,
+  including the testing pass against a known-good 1B or 10B result.
+  Worth doing once you're running 100B+ repeatedly; not worth it for
+  a one-off milestone.
 
 ### Phase 3 — disk-backed bignum (necessary for >100B)
 
