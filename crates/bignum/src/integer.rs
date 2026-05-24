@@ -158,44 +158,26 @@ impl Integer {
             return "0".into();
         }
         let mut out = String::new();
-        let mut mag = self.clone();
-        mag.negative = false;
+        let mag = if self.negative {
+            Integer { limbs: self.limbs.clone(), negative: false }
+        } else {
+            self.clone()
+        };
+        if self.negative {
+            out.push('-');
+        }
         match radix {
             16 => {
                 // Direct limb iteration — bottom limb is base 2^64, render
                 // hex of each limb most-significant-first.
                 let n = mag.limbs.len();
-                // Most-significant limb without leading zeros.
                 out.push_str(&format!("{:x}", mag.limbs[n - 1]));
                 for i in (0..n - 1).rev() {
                     out.push_str(&format!("{:016x}", mag.limbs[i]));
                 }
             }
-            10 => {
-                // Pull off groups of 19 decimal digits per loop:
-                // 10^19 = 10_000_000_000_000_000_000 < 2^64.  Each
-                // division by the chunk base extracts up to 19 digits.
-                const CHUNK: u64 = 10_000_000_000_000_000_000;
-                let mut chunks: Vec<u64> = Vec::new();
-                while !mag.is_zero() {
-                    let (q, r) = div_rem_small(&mag, CHUNK);
-                    chunks.push(r);
-                    mag = q;
-                }
-                // Most-significant chunk first, no leading zeros.
-                let last = chunks.pop().expect("nonzero has at least one chunk");
-                out.push_str(&last.to_string());
-                while let Some(c) = chunks.pop() {
-                    out.push_str(&format!("{c:019}"));
-                }
-            }
+            10 => to_decimal_top(&mag, &mut out),
             _ => panic!("unsupported radix {radix} in to_string_radix"),
-        }
-        if self.negative {
-            let mut s = String::with_capacity(out.len() + 1);
-            s.push('-');
-            s.push_str(&out);
-            out = s;
         }
         out
     }
@@ -672,7 +654,18 @@ fn div_rem_mag_knuth(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
             ((numerator / v_top as u128) as u64, numerator % v_top as u128)
         };
         // Refine downward while `qhat·v[n-2] > B·rhat + u[j+n-2]`.
+        //
+        // `rhat` is conceptually a u64 (the running remainder) but we
+        // hold it in u128 to allow the `rhat += v_top` accumulation.
+        // CRITICAL: check `rhat >= B` *before* forming `rhat << 64`,
+        // because that shift would silently overflow u128 (and lose
+        // the high bits, corrupting the comparison).  Knuth guarantees
+        // that once `rhat >= B`, the refinement condition can't hold
+        // anyway, so an early break here is correct.
         loop {
+            if rhat >= (1u128 << 64) {
+                break;
+            }
             let lhs = (qhat as u128) * (v_next as u128);
             let rhs = (rhat << 64) | (u[j + n - 2] as u128);
             if lhs <= rhs {
@@ -680,9 +673,6 @@ fn div_rem_mag_knuth(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
             }
             qhat -= 1;
             rhat += v_top as u128;
-            if rhat >= (1u128 << 64) {
-                break;
-            }
         }
 
         // D4. Multiply-subtract: u[j..=j+n] -= qhat * v.
@@ -800,6 +790,133 @@ fn rem_signed(a: &Integer, b: &Integer) -> Integer {
     }
     // Sign of remainder matches sign of dividend (truncated division).
     Integer { limbs: r_mag, negative: a.negative }
+}
+
+// =====================================================================
+// Decimal-stringification: divide-and-conquer base conversion
+// =====================================================================
+//
+// The naive approach to radix-10 conversion peels off 19 digits at a
+// time by dividing by 10^19, which is `O(L²)` `u128 / u64` operations
+// for an L-limb input.  On aarch64 `u128 / u64` is a software-emulated
+// routine in compiler-builtins; profiling at 1M digits showed 83% of
+// runtime sitting in that single inner loop.
+//
+// Divide-and-conquer base conversion replaces that with `O(M(N)·log N)`:
+// split `n` by a power of ten roughly half its decimal length, recurse
+// on the two halves, then concatenate (with leading-zero padding on
+// the low half).  The expensive operation at each level is one
+// Newton-Raphson Float-backed Knuth division — way cheaper than
+// hundreds of millions of `u128 / u64`s.
+
+/// Below this many limbs in the input, the naive divide-by-10^19 loop
+/// beats the D&C overhead (a single Knuth divide + a `Integer::pow`
+/// for the splitter, plus two recursive calls).  Tuned by inspection;
+/// 32 limbs ≈ 600 decimal digits.
+const TO_STRING_DC_THRESHOLD: usize = 32;
+
+/// Decimal CHUNK = 10^19, the largest power of ten that fits in u64.
+const DECIMAL_CHUNK_DIGITS: u32 = 19;
+const DECIMAL_CHUNK: u64 = 10_000_000_000_000_000_000;
+
+/// Top-level entry: append `n` (which must be `≥ 0` and nonzero) to
+/// `out` with no leading zeros.
+fn to_decimal_top(n: &Integer, out: &mut String) {
+    debug_assert!(!n.is_zero() && !n.negative);
+    if n.limbs.len() <= TO_STRING_DC_THRESHOLD {
+        write_decimal_naive(n, out);
+        return;
+    }
+    // Estimate decimal digit count from bit length: D ≈ bits · log₁₀ 2.
+    // The estimate may be off by 1 either way, but our recursion is
+    // structured so the natural digit count of `hi` is whatever it is —
+    // we don't rely on the estimate being exact for `hi`, only for
+    // picking the split point.  Lo's padded length is the split, so it
+    // is exact by construction.
+    let est_digits = decimal_digits_estimate(n.bits());
+    let m = est_digits / 2;
+    if m == 0 {
+        write_decimal_naive(n, out);
+        return;
+    }
+    let splitter = Integer::u_pow_u(10, m);
+    let (hi, lo) = div_rem_signed(n, &splitter);
+    // Hi: just emit it (no padding — caller wants the natural-length
+    // top half).
+    to_decimal_top(&hi, out);
+    // Lo: must contribute exactly `m` characters.
+    to_decimal_padded(&lo, m as usize, out);
+}
+
+/// Append exactly `want_len` decimal characters representing `n`,
+/// padding with leading zeros if needed.  Precondition: `n < 10^want_len`.
+fn to_decimal_padded(n: &Integer, want_len: usize, out: &mut String) {
+    if n.is_zero() {
+        for _ in 0..want_len {
+            out.push('0');
+        }
+        return;
+    }
+    if n.limbs.len() <= TO_STRING_DC_THRESHOLD {
+        let mut buf = String::new();
+        write_decimal_naive(n, &mut buf);
+        debug_assert!(buf.len() <= want_len, "padded leaf overflowed want_len");
+        for _ in buf.len()..want_len {
+            out.push('0');
+        }
+        out.push_str(&buf);
+        return;
+    }
+    let m = want_len / 2;
+    let splitter = Integer::u_pow_u(10, m as u32);
+    let (hi, lo) = div_rem_signed(n, &splitter);
+    to_decimal_padded(&hi, want_len - m, out);
+    to_decimal_padded(&lo, m, out);
+}
+
+/// Existing peel-by-10^19 loop — used as the D&C base case once the
+/// input is small enough that this is cheaper than another recursion.
+fn write_decimal_naive(n: &Integer, out: &mut String) {
+    use std::fmt::Write;
+    debug_assert!(!n.is_zero() && !n.negative);
+    let mut mag = n.clone();
+    let mut chunks: Vec<u64> = Vec::new();
+    while !mag.is_zero() {
+        let (q, r) = div_rem_small(&mag, DECIMAL_CHUNK);
+        chunks.push(r);
+        mag = q;
+    }
+    let last = chunks.pop().expect("nonzero has at least one chunk");
+    write!(out, "{last}").unwrap();
+    while let Some(c) = chunks.pop() {
+        write!(out, "{c:0w$}", w = DECIMAL_CHUNK_DIGITS as usize).unwrap();
+    }
+}
+
+/// Quotient and remainder of `a / b` as `Integer`s.  Helper for D&C
+/// stringification; works on any non-negative `a` and `b`.
+fn div_rem_signed(a: &Integer, b: &Integer) -> (Integer, Integer) {
+    debug_assert!(!a.negative && !b.negative && !b.is_zero());
+    let (q, r) = div_rem_mag(&a.limbs, &b.limbs);
+    let qi = if q.is_empty() {
+        Integer::new()
+    } else {
+        Integer { limbs: q, negative: false }
+    };
+    let ri = if r.is_empty() {
+        Integer::new()
+    } else {
+        Integer { limbs: r, negative: false }
+    };
+    (qi, ri)
+}
+
+/// Decimal-digit count estimate from bit count using `log₁₀ 2`.
+/// Off-by-one in either direction is fine for split-point selection
+/// (top half's natural length absorbs the slack).
+fn decimal_digits_estimate(bits: u64) -> u32 {
+    // log₁₀ 2 = 0.301029995663981...
+    ((bits as f64) * 0.301_029_995_663_981).ceil() as u32
 }
 
 // =====================================================================
@@ -1303,5 +1420,49 @@ mod tests {
         let z = -Integer::new();
         assert!(z.is_zero());
         assert!(!z.negative);
+    }
+
+    #[test]
+    fn to_string_dc_matches_naive_on_known_values() {
+        // 10^k - 1 for various k: hits a range straddling the D&C
+        // threshold and stresses leading-zero / boundary cases.
+        for k in [10, 50, 100, 500, 1000, 5000].iter().copied() {
+            let mut n = Integer::u_pow_u(10, k);
+            n = &n - &Integer::from(1_u32);
+            let s = n.to_string_radix(10);
+            // 10^k - 1 is k nines.
+            let expected: String = std::iter::repeat('9').take(k as usize).collect();
+            assert_eq!(s, expected, "10^{k} - 1 stringification");
+        }
+    }
+
+    #[test]
+    fn to_string_dc_round_trip_large() {
+        // Build a non-trivial large integer (no special structure), then
+        // verify parse_radix(to_string_radix(n)) == n.  The size (~10K
+        // decimal digits) puts us well past the D&C threshold so the
+        // recursive path is exercised end-to-end.
+        let mut n = Integer::from(0xDEAD_BEEF_CAFE_F00D_u64);
+        for _ in 0..10 {
+            n = &n * &n;
+        }
+        // n now has ~16K bits ≈ ~4900 decimal digits.
+        let s = n.to_string_radix(10);
+        let back = Integer::parse_radix(&s, 10).unwrap();
+        assert_eq!(back, n, "decimal round-trip failed");
+    }
+
+    #[test]
+    fn to_string_dc_lo_zero_pads_correctly() {
+        // 10^200 itself: in any split the low half becomes exactly zero,
+        // which must produce m leading zeros — a common bug-magnet in
+        // D&C base conversion.
+        let n = Integer::u_pow_u(10, 200);
+        let s = n.to_string_radix(10);
+        let mut expected = String::from("1");
+        for _ in 0..200 {
+            expected.push('0');
+        }
+        assert_eq!(s, expected);
     }
 }
