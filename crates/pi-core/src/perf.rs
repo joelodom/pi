@@ -56,14 +56,24 @@ struct Inner {
     /// (a handful per run) and samples reading this only happen every
     /// `sample_ms` ms — contention is essentially nil.
     current_phase: Mutex<Option<(String, Instant)>>,
-    last_cpu: Mutex<CpuSnapshot>,
+    last_rusage: Mutex<ResourceSnapshot>,
 }
 
+/// One read of `getrusage(RUSAGE_SELF)` plus the wall-clock time at
+/// which we read it.  All counters are cumulative since process start;
+/// `write_sample` does the delta for `cpu_cores`.
 #[derive(Clone, Copy)]
-struct CpuSnapshot {
+struct ResourceSnapshot {
     wall: Instant,
     user_us: u64,
     sys_us: u64,
+    minor_faults: u64,
+    major_faults: u64,
+    ctx_voluntary: u64,
+    ctx_involuntary: u64,
+    /// Peak RSS so far, in bytes.  Sourced from `ru_maxrss` — bytes
+    /// on macOS, KiB on Linux; normalized to bytes here.
+    peak_rss_bytes: u64,
 }
 
 impl PerfRecorder {
@@ -81,7 +91,7 @@ impl PerfRecorder {
             start: now,
             file: Mutex::new(BufWriter::with_capacity(8 * 1024, file)),
             current_phase: Mutex::new(None),
-            last_cpu: Mutex::new(cpu_snapshot_now()),
+            last_rusage: Mutex::new(snapshot_now()),
         });
         let rec = Self { inner: Some(inner) };
         rec.write_run_start(digits, algorithm);
@@ -211,23 +221,23 @@ impl Inner {
         let rss_bytes = read_rss_bytes();
         let rss_mb = rss_bytes / (1024 * 1024);
 
-        // CPU-cores busy: delta user+sys time over delta wall time
-        // since the last sample.  First sample uses the recorder's
-        // start time as the baseline.
-        let now_cpu = cpu_snapshot_now();
-        let mut last = self.last_cpu.lock().unwrap();
-        let wall_us = now_cpu.wall.duration_since(last.wall).as_micros() as u64;
-        let cpu_us = now_cpu
+        // One snapshot fills both the cpu-delta calculation and the
+        // cumulative-counter fields below — getrusage is called once.
+        let now = snapshot_now();
+        let mut last = self.last_rusage.lock().unwrap();
+        let wall_us = now.wall.duration_since(last.wall).as_micros() as u64;
+        let cpu_us = now
             .user_us
             .saturating_sub(last.user_us)
-            .saturating_add(now_cpu.sys_us.saturating_sub(last.sys_us));
-        *last = now_cpu;
+            .saturating_add(now.sys_us.saturating_sub(last.sys_us));
+        *last = now;
         drop(last);
         let cpu_cores = if wall_us == 0 {
             0.0
         } else {
             cpu_us as f64 / wall_us as f64
         };
+        let peak_rss_mb = now.peak_rss_bytes / (1024 * 1024);
 
         let phase_name = self
             .current_phase
@@ -237,9 +247,20 @@ impl Inner {
             .map(|(n, _)| n.clone())
             .unwrap_or_default();
         let phase_esc = json_escape(&phase_name);
+        // Cumulative counters (minor_faults, major_faults, ctx_*) are
+        // emitted as monotonically-increasing totals since process
+        // start.  The analyst computes deltas between adjacent samples
+        // if they want per-interval rates.
         self.write_line(&format!(
             "{{\"t_ms\":{t},\"kind\":\"sample\",\"phase\":{phase_esc},\
-             \"rss_mb\":{rss_mb},\"cpu_cores\":{cpu_cores:.3}}}"
+             \"rss_mb\":{rss_mb},\"peak_rss_mb\":{peak_rss_mb},\
+             \"cpu_cores\":{cpu_cores:.3},\
+             \"minor_faults\":{},\"major_faults\":{},\
+             \"ctx_voluntary\":{},\"ctx_involuntary\":{}}}",
+            now.minor_faults,
+            now.major_faults,
+            now.ctx_voluntary,
+            now.ctx_involuntary,
         ));
     }
 }
@@ -266,28 +287,46 @@ impl Drop for SamplerGuard {
 // Telemetry helpers
 // =====================================================================
 
-fn cpu_snapshot_now() -> CpuSnapshot {
-    let (user_us, sys_us) = read_cpu_times();
-    CpuSnapshot {
-        wall: Instant::now(),
-        user_us,
-        sys_us,
-    }
-}
-
-/// `(user_us, sys_us)` for the current process via `getrusage`.  Both
-/// fields are 0 on error or unsupported platforms.
-fn read_cpu_times() -> (u64, u64) {
+/// One unified `getrusage` + wall-clock read.  Used both to seed the
+/// recorder's baseline and to take each sample's snapshot.
+fn snapshot_now() -> ResourceSnapshot {
+    let wall = Instant::now();
     // SAFETY: zero-init a POD struct; pass valid out-pointer to libc.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     let ret = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
     if ret != 0 {
-        return (0, 0);
+        return ResourceSnapshot {
+            wall,
+            user_us: 0,
+            sys_us: 0,
+            minor_faults: 0,
+            major_faults: 0,
+            ctx_voluntary: 0,
+            ctx_involuntary: 0,
+            peak_rss_bytes: 0,
+        };
     }
     let user_us =
         (usage.ru_utime.tv_sec as u64) * 1_000_000 + (usage.ru_utime.tv_usec as u64);
-    let sys_us = (usage.ru_stime.tv_sec as u64) * 1_000_000 + (usage.ru_stime.tv_usec as u64);
-    (user_us, sys_us)
+    let sys_us =
+        (usage.ru_stime.tv_sec as u64) * 1_000_000 + (usage.ru_stime.tv_usec as u64);
+    // `ru_maxrss` is bytes on macOS, KiB on Linux; we normalize to bytes.
+    #[cfg(target_os = "macos")]
+    let peak_rss_bytes = usage.ru_maxrss as u64;
+    #[cfg(target_os = "linux")]
+    let peak_rss_bytes = (usage.ru_maxrss as u64).saturating_mul(1024);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let peak_rss_bytes = 0_u64;
+    ResourceSnapshot {
+        wall,
+        user_us,
+        sys_us,
+        minor_faults: usage.ru_minflt as u64,
+        major_faults: usage.ru_majflt as u64,
+        ctx_voluntary: usage.ru_nvcsw as u64,
+        ctx_involuntary: usage.ru_nivcsw as u64,
+        peak_rss_bytes,
+    }
 }
 
 /// Resident set size in bytes, or 0 if unavailable.
