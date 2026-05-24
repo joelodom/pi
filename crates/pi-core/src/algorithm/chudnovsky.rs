@@ -106,21 +106,38 @@ impl PiAlgorithm for Chudnovsky {
             let (_p, q, t) = binary_split(1, n_terms + 1, progress);
             progress.end_phase();
 
-            progress.start_phase(PHASE_FINAL_ASSEMBLY, 4);
+            progress.start_phase(PHASE_FINAL_ASSEMBLY, 3);
             // S = (A · Q + T) / Q, where T/Q sums terms k = 1..N and A
-            // is the k = 0 contribution.
+            // is the k = 0 contribution, so
+            //   π = (426880 · √10005 · Q) / (A·Q + T)
+            //     = pi_numer · (1 / denom)
+            //
+            // The two factors `pi_numer` and `1/denom` are independent
+            // — they share no intermediate values.  Both are O(M(N))
+            // chains: the numerator is √10005 (precision-doubling
+            // Newton) times two multiplies, and the reciprocal is
+            // precision-doubling Newton on the integer denominator.
+            // Running them on separate rayon worker threads halves the
+            // serial chain at the top of final assembly.
             let denom_int = Integer::from(A) * &q + &t;
             progress.tick();
 
-            let mut pi = Float::with_val_64(plan.precision_bits, 10_005);
-            pi.sqrt_mut();
+            let prec = plan.precision_bits;
+            let denom_float: Float = denom_int.into();
+
+            let (recip, pi_numer) = rayon::join(
+                || denom_float.reciprocal_at_prec(prec + 16),
+                || {
+                    let mut p = Float::with_val_64(prec, 10_005);
+                    p.sqrt_mut();
+                    p *= 426_880_u32;
+                    p *= &q;
+                    p
+                },
+            );
             progress.tick();
 
-            pi *= 426_880_u32;
-            pi *= &q;
-            progress.tick();
-
-            pi /= &denom_int;
+            let pi = pi_numer.mul_at_prec(&recip, prec);
             progress.tick();
             progress.end_phase();
             pi

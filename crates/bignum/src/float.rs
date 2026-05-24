@@ -328,7 +328,7 @@ impl Float {
     }
 
     /// `self * rhs`.
-    pub(crate) fn mul_at_prec(&self, rhs: &Float, prec: u64) -> Float {
+    pub fn mul_at_prec(&self, rhs: &Float, prec: u64) -> Float {
         if self.is_zero() || rhs.is_zero() {
             return Float { prec, sign: false, mantissa: Integer::new(), exp: 0 };
         }
@@ -414,7 +414,7 @@ impl Float {
     ///
     /// Returns a Float whose value is `1/self` to `target_prec` bits.
     /// Self must be nonzero.
-    pub(crate) fn reciprocal_at_prec(&self, target_prec: u64) -> Float {
+    pub fn reciprocal_at_prec(&self, target_prec: u64) -> Float {
         assert!(!self.is_zero(), "reciprocal of zero");
 
         // Work on |self| and reapply sign at the end so the Newton
