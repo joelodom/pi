@@ -103,7 +103,7 @@ impl PiAlgorithm for Chudnovsky {
         // saves ~16 GB of peak memory.
         let pi = {
             progress.start_phase(PHASE_BINARY_SPLITTING, n_terms);
-            let (_p, q, t) = binary_split(1, n_terms + 1, progress);
+            let (q, t) = binary_split(1, n_terms + 1, progress);
             progress.end_phase();
 
             progress.start_phase(PHASE_FINAL_ASSEMBLY, 3);
@@ -120,28 +120,60 @@ impl PiAlgorithm for Chudnovsky {
             // Running them on separate rayon worker threads halves the
             // serial chain at the top of final assembly.
             let denom_int = Integer::from(A) * &q + &t;
+            // t is no longer needed — free its mantissa now (hundreds
+            // of MB at billion-digit scale) before the NTT-heavy work
+            // below allocates its scratch buffers.
+            drop(t);
             progress.tick();
 
             let prec = plan.precision_bits;
+            // `denom_int` is consumed by `.into()` so its memory
+            // is released when `denom_float` is built.
             let denom_float: Float = denom_int.into();
 
-            let (recip, pi_numer) = rayon::join(
-                || denom_float.reciprocal_at_prec(prec + 16),
-                || {
-                    let mut p = Float::with_val_64(prec, 10_005);
-                    p.sqrt_mut();
-                    p *= 426_880_u32;
-                    p *= &q;
-                    p
-                },
-            );
+            // Two chains compute pi_numer (sqrt · 426880 · q) and
+            // recip (1 / denom).  Running them concurrently fills each
+            // other's NTT serial pockets (~10% faster); running them
+            // sequentially holds only one chain's Float intermediates
+            // live at a time (saves multi-GB peak at billion-digit
+            // scale).  Knob lives in chudnovsky.parallel_final_assembly.
+            let (recip, pi_numer) = if crate::config::chudnovsky_parallel_final_assembly() {
+                rayon::join(
+                    || denom_float.reciprocal_at_prec(prec + 16),
+                    || {
+                        let mut p = Float::with_val_64(prec, 10_005);
+                        p.sqrt_mut();
+                        p *= 426_880_u32;
+                        p *= &q;
+                        p
+                    },
+                )
+            } else {
+                let recip = denom_float.reciprocal_at_prec(prec + 16);
+                let mut p = Float::with_val_64(prec, 10_005);
+                p.sqrt_mut();
+                p *= 426_880_u32;
+                p *= &q;
+                (recip, p)
+            };
+            // Once both chains have returned, neither `q` nor
+            // `denom_float` is referenced again.  Drop them before the
+            // final multiply so its NTT buffers don't stack on top of
+            // the now-dead mantissas.
+            drop(q);
+            drop(denom_float);
             progress.tick();
 
             let pi = pi_numer.mul_at_prec(&recip, prec);
+            // Free the two operands of the final multiply now that the
+            // result is built — keeps peak below `recip + pi_numer +
+            // pi` (which is 3 full-precision Floats).
+            drop(pi_numer);
+            drop(recip);
             progress.tick();
             progress.end_phase();
             pi
-            // _p, q, t, denom_int all dropped here.
+            // q, t, denom_int all dropped here.
         };
 
         progress.start_phase(PHASE_DECIMAL_CONVERSION, 1);
@@ -155,11 +187,13 @@ impl PiAlgorithm for Chudnovsky {
 
 /// Binary splitting over the half-open range `[a, b)` of Chudnovsky terms.
 ///
-/// Returns `(P, Q, T)` such that, with `M_0 = 1`,
-/// `Σ_{k=a}^{b-1} M_k L_k = (M_{a-1} · T) / Q`.
-///
-/// The top-level caller invokes this with `a = 1`, so `M_{a-1} = M_0 = 1`
-/// and the partial sum is exactly `T / Q`.
+/// Returns `(Q, T)` such that the partial sum equals `T / Q` (with
+/// `M_0 = 1` for the conventional top-level call `a = 1`).  The `P`
+/// factor of the recursion *is* computed for every internal merge but
+/// is intentionally *not* computed at the root: the caller throws it
+/// away, and at billion-digit scale the root P multiply is a huge
+/// NTT call (multi-GB scratch buffers) for a discarded result.  See
+/// `binary_split_pure_root` for the no-P entry.
 ///
 /// Progress: the parallel work runs on a worker thread (which dispatches
 /// to the rayon pool internally), while this function polls a shared
@@ -171,7 +205,7 @@ fn binary_split(
     a: u64,
     b: u64,
     progress: &mut dyn ProgressReporter,
-) -> (Integer, Integer, Integer) {
+) -> (Integer, Integer) {
     let n_terms = b - a;
     let total_weight = total_merge_weight(a, b).max(1);
     let done_weight = Arc::new(AtomicU64::new(0));
@@ -181,7 +215,7 @@ fn binary_split(
         let done_weight = Arc::clone(&done_weight);
         let finished = Arc::clone(&finished);
         std::thread::spawn(move || {
-            let result = binary_split_pure(a, b, &done_weight);
+            let result = binary_split_pure_root(a, b, &done_weight);
             // Release: every fetch_add above happens-before this store,
             // so a reader that sees `finished == true` via Acquire is
             // guaranteed to see every weight contribution as well.
@@ -239,6 +273,61 @@ fn total_merge_weight(a: u64, b: u64) -> u64 {
     }
     let m = (a + b) / 2;
     merge_weight(b - a) + total_merge_weight(a, m) + total_merge_weight(m, b)
+}
+
+/// Decide whether a binary-split node of size `n` recurses in parallel
+/// or sequentially.  Two thresholds:
+/// * below `parallel_split_threshold` → sequential (rayon overhead
+///   would outweigh the saved time);
+/// * above `sequential_top_threshold` (when non-zero) → sequential,
+///   to keep concurrent NTT scratch buffers bounded at huge sizes.
+/// Between the two → parallel via `rayon::join`.
+#[inline]
+fn go_parallel(n: u64) -> bool {
+    let lo = crate::config::chudnovsky_parallel_split_threshold();
+    let hi = crate::config::chudnovsky_sequential_top_threshold();
+    n >= lo && (hi == 0 || n < hi)
+}
+
+/// Root entry that returns only `(Q, T)` — skips the final `p_root =
+/// p_l * p_r` multiplication that the regular recursion performs at
+/// every internal node.  Justification: the caller of `binary_split`
+/// discards `_p`, but in the all-paths-equal recursion that p_root
+/// triggers a huge NTT call (at 1B-digit scale: ~4 GB scratch buffers)
+/// for a result that's never read.  Both sub-recursions still go
+/// through `binary_split_pure` so all internal merges compute p
+/// correctly.  We also `drop` the two sub-p factors as soon as the
+/// merge is done so their memory is reclaimed before the q multiply.
+fn binary_split_pure_root(a: u64, b: u64, done_weight: &AtomicU64) -> (Integer, Integer) {
+    debug_assert!(a < b);
+    if b - a == 1 {
+        // Single-term root — no big multiplies to skip.  Fall back to
+        // the regular path and discard p.
+        let (_, q, t) = binary_split_pure(a, b, done_weight);
+        return (q, t);
+    }
+    let m = (a + b) / 2;
+    let ((p_l, q_l, t_l), (p_r, q_r, t_r)) =
+        if go_parallel(b - a) {
+            rayon::join(
+                || binary_split_pure(a, m, done_weight),
+                || binary_split_pure(m, b, done_weight),
+            )
+        } else {
+            (
+                binary_split_pure(a, m, done_weight),
+                binary_split_pure(m, b, done_weight),
+            )
+        };
+    // t still needs p_l from the left subtree.  q needs neither.
+    // After the t and q computations, p_l and p_r are unreferenced;
+    // explicit drops free them before the q multiply runs.
+    let t = t_l * &q_r + &p_l * t_r;
+    drop(p_l);
+    drop(p_r);
+    let q = q_l * q_r;
+    done_weight.fetch_add(merge_weight(b - a), Ordering::Relaxed);
+    (q, t)
 }
 
 /// Pure (no-progress-callback, `Send`-safe) variant of binary splitting.

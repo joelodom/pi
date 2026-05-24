@@ -94,6 +94,24 @@ parallel_pointwise_threshold = 1024
 # rayon::join overhead exceeds the saved work.
 parallel_split_threshold = 64
 
+# MEMORY-CONSERVATIVE knob — only meaningful at very large digit
+# counts (~100M+ on a 16-32 GB box).  Subtrees with size at or above
+# this threshold serialise their two halves instead of running them
+# in parallel, so only ONE huge NTT call is live at a time at the top
+# of the tree.  Each big NTT still uses all rayon workers internally
+# for its butterflies — we just don't run two of them concurrently.
+# Trades a small amount of wall time for several GB of peak RSS at
+# 1B+ scale.  Set to `0` for full parallelism (best speed, highest
+# memory).  Suggested value on 16-32 GB laptops: 5_000_000.
+sequential_top_threshold = 1000000
+
+# MEMORY-CONSERVATIVE knob — at billion-digit scale, the parallel
+# numerator/reciprocal chains in final assembly keep ~2× as many
+# multi-GB Float intermediates live as the sequential version.
+# Sequential is ~10% slower at our scale, but saves a few GB peak.
+# Set to `true` for the speed-optimised default.
+parallel_final_assembly = false
+
 
 [decimal_conversion]
 # Limb count below which the divide-and-conquer base-10 conversion

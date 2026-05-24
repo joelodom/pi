@@ -180,6 +180,8 @@ struct NttSection {
 #[serde(default, deny_unknown_fields)]
 struct ChudnovskySection {
     parallel_split_threshold: Option<u64>,
+    sequential_top_threshold: Option<u64>,
+    parallel_final_assembly: Option<bool>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -240,6 +242,12 @@ fn load_and_apply_config(path: Option<&Path>) -> Result<()> {
     }
     if let Some(v) = file_cfg.chudnovsky.parallel_split_threshold {
         pc.chudnovsky.parallel_split_threshold = v;
+    }
+    if let Some(v) = file_cfg.chudnovsky.sequential_top_threshold {
+        pc.chudnovsky.sequential_top_threshold = v;
+    }
+    if let Some(v) = file_cfg.chudnovsky.parallel_final_assembly {
+        pc.chudnovsky.parallel_final_assembly = v;
     }
     if let Some(v) = file_cfg.perf.default_sample_ms {
         pc.perf.default_sample_ms = v;
