@@ -126,7 +126,21 @@ impl Float {
         x.exp += half_exp;
         x.round_to_prec();
 
-        while current_prec < target_prec + 16 {
+        // Loop runs at progressively higher precision until current_prec
+        // hits the cap (target+16), then runs *one more* iteration at
+        // that cap before stopping.  The extra iteration is essential:
+        // the doubling iter that first hits the cap runs at full target
+        // precision but its INPUT only has accuracy ~target/2 (limited
+        // by the previous iter's precision), so its output is accurate
+        // to only ~target/2 bits.  One more pass with full-accuracy
+        // input is what actually delivers full target accuracy.
+        //
+        // Without the extra iteration the result silently loses
+        // ~target/2 bits of accuracy whenever log₂(target/52) isn't a
+        // whole number — for pi-compute that bit it hard above ~3M
+        // digits (5M lost ~900K decimal digits, 10M lost ~1.4M).
+        let mut full_prec_iters = 0;
+        loop {
             current_prec = (current_prec * 2).min(target_prec + 16);
 
             // Truncate N to current_prec for the division.
@@ -148,6 +162,13 @@ impl Float {
             sum.prec = current_prec;
             sum.round_to_prec();
             x = sum;
+
+            if current_prec >= target_prec + 16 {
+                full_prec_iters += 1;
+                if full_prec_iters >= 2 {
+                    break;
+                }
+            }
         }
 
         x.prec = target_prec;
@@ -414,8 +435,14 @@ impl Float {
         x.exp += neg_exp;
         x.round_to_prec();
 
+        // See the matching comment in `sqrt_mut`: the doubling sequence
+        // alone falls one iteration short of full target accuracy
+        // whenever log₂(target/52) isn't a whole number.  We force one
+        // extra iteration at the cap to bring accuracy from ~target/2
+        // up to full target.
         let mut current_prec = 64_u64;
-        while current_prec < target_prec + 16 {
+        let mut full_prec_iters = 0;
+        loop {
             current_prec = (current_prec * 2).min(target_prec + 16);
 
             // Truncate `self` to current_prec for the same reason as
@@ -439,6 +466,13 @@ impl Float {
             let two_minus_bx = two.sub_at_prec(&bx, current_prec + 8);
             // x_new = x * (2 - bx).   Roughly doubles the correct bits.
             x = x.mul_at_prec(&two_minus_bx, current_prec);
+
+            if current_prec >= target_prec + 16 {
+                full_prec_iters += 1;
+                if full_prec_iters >= 2 {
+                    break;
+                }
+            }
         }
 
         x.prec = target_prec;
@@ -1039,6 +1073,48 @@ mod tests {
         sq.square_mut();
         let exp = Float::with_val_64(512, 10_005_u32);
         assert!(approx_eq(&sq, &exp, 4));
+    }
+
+    #[test]
+    fn sqrt_at_off_by_one_bug_precision() {
+        // The precision-doubling Newton sqrt previously fell one
+        // iteration short of full accuracy whenever frac(log₂(prec/64))
+        // > ~0.7 — the final doubling iter ran at full precision but
+        // its input had only target/2 bits of accuracy, so the output
+        // also had only target/2 bits.  At pi-compute scale this
+        // started producing wrong digits past ~5M decimal digits.
+        //
+        // 110000-bit precision triggers the same condition at small
+        // scale: log₂(110000/64) ≈ 10.75, fractional part 0.75 > 0.7.
+        // Without the fix, sqrt(N).square() differs from N by far more
+        // than the 4-ULP test tolerance.
+        let prec = 110_000_u64;
+        let mut a = Float::with_val_64(prec, 10_005_u32);
+        a.sqrt_mut();
+        let mut sq = a.clone();
+        sq.square_mut();
+        let exp = Float::with_val_64(prec, 10_005_u32);
+        assert!(
+            approx_eq(&sq, &exp, 8),
+            "sqrt didn't converge to full precision at 110000 bits",
+        );
+    }
+
+    #[test]
+    fn reciprocal_at_off_by_one_bug_precision() {
+        // Same off-by-one as `sqrt_at_off_by_one_bug_precision`, but for
+        // the Newton reciprocal: the doubling sequence falls one iter
+        // short of full accuracy at the same precision threshold.
+        let prec = 110_000_u64;
+        let three = Float::with_val_64(prec, 3_u32);
+        let recip = three.reciprocal_at_prec(prec);
+        // 3 * (1/3) should be ≈ 1 to ~full precision.
+        let product = three.mul_at_prec(&recip, prec);
+        let one = Float::with_val_64(prec, 1_u32);
+        assert!(
+            approx_eq(&product, &one, 8),
+            "reciprocal didn't converge to full precision at 110000 bits",
+        );
     }
 
     #[test]
