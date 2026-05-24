@@ -1,0 +1,78 @@
+# =============================================================================
+# pi performance config: mid-tier server (~32 cores, 128 GB RAM)
+# =============================================================================
+#
+# Target: ~32 logical cores (16 physical + SMT), 128 GB RAM,
+# server-class memory bandwidth.  Compared to the laptop config, the
+# tunings here:
+#   * Pin rayon to the actual core count (not the SMT count) when
+#     memory-bandwidth-bound — modular arithmetic doesn't benefit from
+#     SMT and the extra thread oversubscription just adds context-
+#     switch overhead.
+#   * Lower the parallelism cross-over thresholds so more sub-tasks
+#     are exposed to the larger pool.
+#   * Slightly lower the NTT task size to keep more tasks resident
+#     across the larger number of L2s.
+#
+# Pi sizes this machine handles comfortably: 100M is ~2 minutes,
+# 1B is ~25-30 minutes, 10B is ~5 hours.  Memory headroom is fine
+# through ~3B digits.
+# =============================================================================
+
+[runtime]
+# Pin to 32 — matches the physical core count on a typical 16-core +
+# SMT box.  Override if your machine has a different topology.
+# Setting to 0 (autodetect) on SMT systems often over-subscribes.
+threads = 32
+
+
+[bignum]
+# Crossover where Karatsuba beats schoolbook.  Algorithmic, not
+# hardware-sensitive; unchanged from laptop.
+karatsuba_threshold = 32
+
+# LOWERED from 512 to 256.  With 32 cores, you want more sub-multiply
+# tasks exposed to the scheduler so no core sits idle while one
+# Karatsuba level finishes.  At 256 limbs the per-sub-mult work is
+# still big enough (~16 KB ≈ 5K digits) that the rayon::join overhead
+# is amortised.
+parallel_karatsuba_threshold = 256
+
+# Unchanged.  The Karatsuba-to-NTT cross-over is dominated by
+# constant factors of NTT setup, not core count.  Tune by benchmark
+# if you have memory bandwidth substantially different from a laptop.
+ntt_threshold = 8192
+
+newton_div_threshold = 64
+
+
+[bignum.ntt]
+# LOWERED from 65536 to 32768.  With more cores, smaller tasks fan
+# out work more evenly.  Still 256 KB per task — comfortably L2-
+# resident on server CPUs.
+target_task_size = 32768
+
+# Unchanged — pack/pointwise parallelism cross-overs don't shift
+# much with core count.
+parallel_pack_threshold = 1024
+parallel_pointwise_threshold = 1024
+
+
+[chudnovsky]
+# LOWERED from 64 to 32.  More cores want more parallel subtrees at
+# the leaves of the binary-splitting recursion.
+parallel_split_threshold = 32
+
+
+[decimal_conversion]
+to_string_dc_threshold = 32
+
+# LOWERED from 256 to 128.  More cores, same reasoning.
+parallel_to_string_threshold = 128
+
+
+[perf]
+# RAISED from 500 to 1000 ms.  Runs at this hardware tier are minutes-
+# to-hours; 500 ms generates a lot of sample lines.  Override on the
+# CLI with `--performance-sample-ms 250` for short tuning runs.
+default_sample_ms = 1000

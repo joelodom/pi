@@ -433,31 +433,17 @@ fn sub_signed(a: &Integer, b: &Integer) -> Integer {
 /// Below this many limbs in the smaller operand, schoolbook beats
 /// Karatsuba (the constant-factor overhead of 3 recursive calls plus
 /// the extra adds and subtracts outweighs the saved multiplication).
-/// 32 limbs ≈ 2048 bits ≈ 620 decimal digits — a reasonable cross-over
-/// for our scratch-allocating implementation.  GMP's empirical default
-/// on x86-64 is in the same neighborhood (~28 limbs).
-const KARATSUBA_THRESHOLD: usize = 32;
-
-/// Operand size (in limbs) at which Goldilocks NTT multiplication
-/// outruns Karatsuba.  Karatsuba is `O(N^1.585)`, NTT is `O(N log N)`
-/// but with a large constant from forward/inverse transforms.  The
-/// crossover lives somewhere in the low thousands of limbs on this
-/// hardware; we'll tune after measuring.  Both operands must exceed
-/// this size before NTT is selected, since the cost is governed by
-/// the *larger* operand (the transform length is set by `n_a + n_b`).
-const NTT_THRESHOLD: usize = 8192;
-
 /// Dispatch: NTT for very large operands, Karatsuba for medium,
-/// schoolbook for small.  See [`NTT_THRESHOLD`] and
-/// [`KARATSUBA_THRESHOLD`].
+/// schoolbook for small.  Thresholds live in [`crate::config`] and
+/// are tunable at runtime (see `config/*.toml`).
 fn mul_mag(a: &[u64], b: &[u64]) -> Vec<u64> {
     if a.is_empty() || b.is_empty() {
         return Vec::new();
     }
     let smaller = a.len().min(b.len());
-    if smaller >= NTT_THRESHOLD {
+    if smaller >= crate::config::ntt_threshold() {
         crate::ntt::mul_mag_ntt(a, b)
-    } else if smaller < KARATSUBA_THRESHOLD {
+    } else if smaller < crate::config::karatsuba_threshold() {
         mul_mag_schoolbook(a, b)
     } else {
         mul_mag_karatsuba(a, b)
@@ -502,10 +488,9 @@ fn mul_mag_schoolbook(a: &[u64], b: &[u64]) -> Vec<u64> {
 /// pure Karatsuba (down to the schoolbook leaves) but run sequentially
 /// — rayon's task overhead would otherwise eat any saving.
 ///
-/// 512 limbs ≈ 32K bits ≈ 10K decimal digits.  At top-level mults of
-/// 80K+ limbs this gives us several levels of 3-way parallelism before
+/// Threshold lives in [`crate::config`].  At top-level mults of 80K+
+/// limbs this gives us several levels of 3-way parallelism before
 /// switching back to sequential.
-const PARALLEL_KARATSUBA_THRESHOLD: usize = 512;
 
 /// Karatsuba multiplication on magnitudes — O(N^log₂3) ≈ O(N^1.585).
 ///
@@ -542,7 +527,8 @@ fn mul_mag_karatsuba(a: &[u64], b: &[u64]) -> Vec<u64> {
 
     // The three sub-mults are independent and dominate the cost.  At
     // large sizes, dispatch them across rayon worker threads.
-    let go_parallel = a.len().min(b.len()) >= PARALLEL_KARATSUBA_THRESHOLD;
+    let go_parallel =
+        a.len().min(b.len()) >= crate::config::parallel_karatsuba_threshold();
 
     let (z0, z2, z1_prod) = if go_parallel {
         // Pre-compute the addends so they can be moved into the rayon
@@ -862,30 +848,15 @@ fn rem_signed(a: &Integer, b: &Integer) -> Integer {
 // Newton-Raphson Float-backed Knuth division — way cheaper than
 // hundreds of millions of `u128 / u64`s.
 
-/// Below this many limbs in the input, the naive divide-by-10^19 loop
-/// beats the D&C overhead (a single Knuth divide + a `Integer::pow`
-/// for the splitter, plus two recursive calls).  Tuned by inspection;
-/// 32 limbs ≈ 600 decimal digits.
-const TO_STRING_DC_THRESHOLD: usize = 32;
-
 /// Decimal CHUNK = 10^19, the largest power of ten that fits in u64.
 const DECIMAL_CHUNK_DIGITS: u32 = 19;
 const DECIMAL_CHUNK: u64 = 10_000_000_000_000_000_000;
-
-/// Above this subtree limb-count, the D&C base-conversion recursion
-/// forks the hi/lo branches onto separate rayon worker threads.  The
-/// branches are completely independent — each does its own division
-/// against `10^m` and writes into its own String, then the parent
-/// concatenates the two.  Below this threshold the per-branch work is
-/// small enough that `rayon::join` task overhead would dominate, so
-/// the recursion stays sequential.
-const PARALLEL_TO_STRING_THRESHOLD: usize = 256;
 
 /// Top-level entry: render `n` (which must be `≥ 0` and nonzero) as a
 /// decimal String with no leading zeros.
 fn to_decimal_top(n: &Integer) -> String {
     debug_assert!(!n.is_zero() && !n.negative);
-    if n.limbs.len() <= TO_STRING_DC_THRESHOLD {
+    if n.limbs.len() <= crate::config::to_string_dc_threshold() {
         let mut out = String::new();
         write_decimal_naive(n, &mut out);
         return out;
@@ -907,7 +878,9 @@ fn to_decimal_top(n: &Integer) -> String {
     let (hi, lo) = div_rem_signed(n, &splitter);
     // Hi: just emit it (no padding — caller wants the natural-length
     // top half).  Lo: exactly `m` characters.
-    let (mut hi_str, lo_str) = if n.limbs.len() >= PARALLEL_TO_STRING_THRESHOLD {
+    let (mut hi_str, lo_str) = if n.limbs.len()
+        >= crate::config::parallel_to_string_threshold()
+    {
         rayon::join(
             || to_decimal_top(&hi),
             || to_decimal_padded(&lo, m as usize),
@@ -926,7 +899,7 @@ fn to_decimal_padded(n: &Integer, want_len: usize) -> String {
     if n.is_zero() {
         return "0".repeat(want_len);
     }
-    if n.limbs.len() <= TO_STRING_DC_THRESHOLD {
+    if n.limbs.len() <= crate::config::to_string_dc_threshold() {
         let mut buf = String::new();
         write_decimal_naive(n, &mut buf);
         debug_assert!(buf.len() <= want_len, "padded leaf overflowed want_len");
@@ -940,7 +913,9 @@ fn to_decimal_padded(n: &Integer, want_len: usize) -> String {
     let m = want_len / 2;
     let splitter = Integer::u_pow_u(10, m as u32);
     let (hi, lo) = div_rem_signed(n, &splitter);
-    let (mut hi_str, lo_str) = if n.limbs.len() >= PARALLEL_TO_STRING_THRESHOLD {
+    let (mut hi_str, lo_str) = if n.limbs.len()
+        >= crate::config::parallel_to_string_threshold()
+    {
         rayon::join(
             || to_decimal_padded(&hi, want_len - m),
             || to_decimal_padded(&lo, m),
@@ -980,8 +955,9 @@ fn write_decimal_naive(n: &Integer, out: &mut String) {
 /// whose constants win below the crossover.
 fn div_rem_signed(a: &Integer, b: &Integer) -> (Integer, Integer) {
     debug_assert!(!a.negative && !b.negative && !b.is_zero());
-    if b.limbs.len() >= NEWTON_DIV_THRESHOLD
-        && a.limbs.len() >= NEWTON_DIV_THRESHOLD
+    let nd_threshold = crate::config::newton_div_threshold();
+    if b.limbs.len() >= nd_threshold
+        && a.limbs.len() >= nd_threshold
         && cmp_mag(&a.limbs, &b.limbs) != Ordering::Less
     {
         return div_rem_newton(a, b);
@@ -1000,13 +976,8 @@ fn div_rem_signed(a: &Integer, b: &Integer) -> (Integer, Integer) {
     (qi, ri)
 }
 
-/// Crossover above which `div_rem_signed` uses Newton–Raphson reciprocal
-/// division instead of Knuth Algorithm D.  Below this size Knuth's
-/// lower constants (no Float setup, no reciprocal iteration) win; above
-/// it NR's O(M(N)) asymptotic dominates Knuth's O(N²).  Picked to land
-/// well above Karatsuba's own threshold so the multiplications inside
-/// NR are themselves subquadratic.
-const NEWTON_DIV_THRESHOLD: usize = 64;
+// Newton-div threshold lives in `crate::config`.  Below it Knuth's
+// lower constants win; above, NR's O(M(N)) dominates Knuth's O(N²).
 
 /// Newton–Raphson reciprocal integer division for non-negative operands.
 /// Returns `(a / b, a mod b)` exactly.

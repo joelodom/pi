@@ -216,11 +216,10 @@ fn binary_split(
     result
 }
 
-/// Subtree sizes below this run sequentially.  Above it, the two halves
-/// of the range are forked via `rayon::join` so the recursion exposes
-/// parallelism at every level until the granularity shrinks below the
-/// per-task overhead.  64 ≈ 6 levels of doubling above the leaves.
-const PARALLEL_SPLIT_THRESHOLD: u64 = 64;
+// Subtree sizes below this run sequentially.  Above it, the two halves
+// of the range are forked via `rayon::join` so the recursion exposes
+// parallelism at every level until the granularity shrinks below the
+// per-task overhead.  Threshold lives in `crate::config`.
 
 /// Karatsuba-aware cost estimate for one merge over `n` terms.
 ///
@@ -267,7 +266,9 @@ fn binary_split_pure(a: u64, b: u64, done_weight: &AtomicU64) -> (Integer, Integ
         (p, q, t)
     } else {
         let m = (a + b) / 2;
-        let ((p_l, q_l, t_l), (p_r, q_r, t_r)) = if b - a >= PARALLEL_SPLIT_THRESHOLD {
+        let ((p_l, q_l, t_l), (p_r, q_r, t_r)) =
+            if b - a >= crate::config::chudnovsky_parallel_split_threshold()
+        {
             rayon::join(
                 || binary_split_pure(a, m, done_weight),
                 || binary_split_pure(m, b, done_weight),

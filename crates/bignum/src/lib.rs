@@ -9,6 +9,7 @@
 //!
 //! Only the standard library is used.
 
+pub mod config;
 pub mod float;
 pub mod integer;
 pub(crate) mod ntt;

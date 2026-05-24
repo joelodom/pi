@@ -27,6 +27,7 @@
 
 pub mod algorithm;
 pub mod bbp;
+pub mod config;
 pub mod output;
 pub mod perf;
 pub mod precision;

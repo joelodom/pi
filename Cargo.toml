@@ -18,6 +18,8 @@ indicatif = "0.17"
 libc = "0.2"
 rand = "0.8"
 rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 # Release profile tuned for the long-running compute path.  LTO is worth a
 # few percent on GMP-heavy workloads, and a single codegen unit lets the

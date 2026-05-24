@@ -19,3 +19,5 @@ ctrlc.workspace = true
 indicatif.workspace = true
 rand.workspace = true
 rayon.workspace = true
+serde.workspace = true
+toml.workspace = true

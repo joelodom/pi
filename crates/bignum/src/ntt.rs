@@ -192,7 +192,7 @@ pub(crate) fn ntt_inverse(a: &mut [u64]) {
     butterflies(a, /*inverse=*/ true);
     // Final scale by `1/n`.  Embarrassingly parallel.
     let n_inv = inv(n as u64);
-    if n >= PARALLEL_POINTWISE_THRESHOLD {
+    if n >= crate::config::ntt_parallel_pointwise_threshold() {
         a.par_iter_mut().for_each(|x| *x = mul(*x, n_inv));
     } else {
         for x in a.iter_mut() {
@@ -200,12 +200,6 @@ pub(crate) fn ntt_inverse(a: &mut [u64]) {
         }
     }
 }
-
-/// Target butterfly-task size in elements.  Each rayon task spans
-/// roughly this many array entries, so the per-task work amortizes
-/// `rayon::join` overhead and stays L2-resident on common hardware
-/// (`1 << 16` × 8 B = 512 KB).  Tunable; not load-bearing.
-const TARGET_TASK_SIZE: usize = 1 << 16;
 
 /// Body of the Cooley-Tukey iteration: log₂(n) passes of butterflies.
 ///
@@ -222,6 +216,10 @@ const TARGET_TASK_SIZE: usize = 1 << 16;
 ///   * Very small inputs — sequential.
 fn butterflies(a: &mut [u64], inverse: bool) {
     let n = a.len();
+    // Read once per transform — the config is immutable during the
+    // run, and one relaxed load per pass would still be cheap, but
+    // caching keeps the inner branches comparing against a register.
+    let target_task = crate::config::ntt_target_task_size();
     let mut len = 2usize;
     while len <= n {
         let half = len / 2;
@@ -234,7 +232,7 @@ fn butterflies(a: &mut [u64], inverse: bool) {
 
         let groups = n / len;
 
-        if half >= TARGET_TASK_SIZE && groups < 4 {
+        if half >= target_task && groups < 4 {
             // Late pass: only a handful of groups, but each is large
             // enough that intra-group parallelism is worthwhile.  Each
             // butterfly touches one element from each half of the
@@ -243,11 +241,11 @@ fn butterflies(a: &mut [u64], inverse: bool) {
             for group in a.chunks_mut(len) {
                 let (lo, hi) = group.split_at_mut(half);
                 let tw = &twiddles;
-                lo.par_chunks_mut(TARGET_TASK_SIZE)
-                    .zip(hi.par_chunks_mut(TARGET_TASK_SIZE))
+                lo.par_chunks_mut(target_task)
+                    .zip(hi.par_chunks_mut(target_task))
                     .enumerate()
                     .for_each(|(chunk_idx, (lo_chunk, hi_chunk))| {
-                        let base = chunk_idx * TARGET_TASK_SIZE;
+                        let base = chunk_idx * target_task;
                         for j in 0..lo_chunk.len() {
                             let u = lo_chunk[j];
                             let t = mul(tw[base + j], hi_chunk[j]);
@@ -258,10 +256,10 @@ fn butterflies(a: &mut [u64], inverse: bool) {
             }
         } else {
             // Standard: par_chunks_mut by (possibly bundled) groups.
-            let task_size = if len >= TARGET_TASK_SIZE {
+            let task_size = if len >= target_task {
                 len
-            } else if n >= TARGET_TASK_SIZE {
-                TARGET_TASK_SIZE
+            } else if n >= target_task {
+                target_task
             } else {
                 n
             };
@@ -324,7 +322,7 @@ fn pack(limbs: &[u64], coeffs: &mut [u64]) {
     let needed = limbs.len() * COEFFS_PER_LIMB;
     assert!(coeffs.len() >= needed, "coeffs buffer too small for pack");
     let (live, tail) = coeffs.split_at_mut(needed);
-    if limbs.len() >= PARALLEL_PACK_THRESHOLD {
+    if limbs.len() >= crate::config::ntt_parallel_pack_threshold() {
         live.par_chunks_mut(COEFFS_PER_LIMB)
             .zip(limbs.par_iter())
             .for_each(|(chunk, &limb)| {
@@ -347,7 +345,7 @@ fn pack(limbs: &[u64], coeffs: &mut [u64]) {
     }
 }
 
-const PARALLEL_PACK_THRESHOLD: usize = 1024;
+// `parallel_pack_threshold` lives in crate::config.
 
 /// Unpack convolution-output coefficients back into a little-endian
 /// u64 limb vector.  Each input coefficient sits at bit position
@@ -428,7 +426,7 @@ pub(crate) fn mul_mag_ntt(a: &[u64], b: &[u64]) -> Vec<u64> {
     rayon::join(|| ntt_forward(&mut pa), || ntt_forward(&mut pb));
 
     // Pointwise multiply: each lane independent, perfectly parallel.
-    if n >= PARALLEL_POINTWISE_THRESHOLD {
+    if n >= crate::config::ntt_parallel_pointwise_threshold() {
         pa.par_iter_mut().zip(pb.par_iter()).for_each(|(x, y)| {
             *x = mul(*x, *y);
         });
@@ -446,7 +444,7 @@ pub(crate) fn mul_mag_ntt(a: &[u64], b: &[u64]) -> Vec<u64> {
     unpack(&pa[..n_out])
 }
 
-const PARALLEL_POINTWISE_THRESHOLD: usize = 1024;
+// `parallel_pointwise_threshold` lives in crate::config.
 
 // =====================================================================
 // Tests for field arithmetic + NTT + pack/unpack + top-level multiply

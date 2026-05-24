@@ -64,9 +64,19 @@ struct Cli {
     /// meaningful when `--performance-file` is set.  Small values
     /// give finer time resolution at the cost of more lines in the
     /// output; the sampler itself is cheap (< 0.1% of one core at
-    /// 500 ms).
-    #[arg(long, default_value_t = 500, value_name = "MS")]
-    performance_sample_ms: u64,
+    /// 500 ms).  Defaults to `perf.default_sample_ms` from the loaded
+    /// config (laptop default: 500 ms).
+    #[arg(long, value_name = "MS")]
+    performance_sample_ms: Option<u64>,
+
+    /// Path to a TOML configuration file with per-machine performance
+    /// tuning (NTT / Karatsuba thresholds, parallelism breakpoints,
+    /// rayon thread pool size, etc.).  When omitted, laptop-class
+    /// defaults are used.  See `config/laptop.toml`,
+    /// `config/server-128gb.toml`, and `config/server-massive.toml`
+    /// for examples and per-knob documentation.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
 
     /// Verify two digit files against each other instead of computing.
     /// Trims trailing whitespace on both, then byte-by-byte compares the
@@ -122,8 +132,144 @@ impl From<AlgorithmFlag> for AlgorithmKind {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Config-file loader.  Parses the optional TOML file into a struct, then
+// hands the values off to `bignum::config::apply` and
+// `pi_core::config::apply`.  Missing fields fall back to the laptop
+// defaults baked into each crate.  Setting `runtime.threads` to a
+// non-zero value resizes the rayon global thread pool.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileConfig {
+    runtime: RuntimeSection,
+    bignum: BignumSection,
+    chudnovsky: ChudnovskySection,
+    decimal_conversion: DecimalSection,
+    perf: PerfSection,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RuntimeSection {
+    /// Number of rayon worker threads.  Zero = autodetect (one per
+    /// logical core).  Non-zero overrides the pool size.
+    threads: usize,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct BignumSection {
+    karatsuba_threshold: Option<usize>,
+    parallel_karatsuba_threshold: Option<usize>,
+    ntt_threshold: Option<usize>,
+    newton_div_threshold: Option<usize>,
+    ntt: NttSection,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct NttSection {
+    target_task_size: Option<usize>,
+    parallel_pack_threshold: Option<usize>,
+    parallel_pointwise_threshold: Option<usize>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ChudnovskySection {
+    parallel_split_threshold: Option<u64>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct DecimalSection {
+    to_string_dc_threshold: Option<usize>,
+    parallel_to_string_threshold: Option<usize>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PerfSection {
+    default_sample_ms: Option<u64>,
+}
+
+fn load_and_apply_config(path: Option<&Path>) -> Result<()> {
+    let file_cfg: FileConfig = match path {
+        None => FileConfig::default(),
+        Some(p) => {
+            let text = std::fs::read_to_string(p)
+                .with_context(|| format!("reading config `{}`", p.display()))?;
+            toml::from_str(&text)
+                .with_context(|| format!("parsing config `{}`", p.display()))?
+        }
+    };
+
+    // Build the per-crate Config structs starting from each crate's
+    // laptop defaults and overlaying any fields the file specifies.
+    let mut bn = bignum::config::Config::default();
+    let mut pc = pi_core::config::Config::default();
+
+    if let Some(v) = file_cfg.bignum.karatsuba_threshold {
+        bn.karatsuba_threshold = v;
+    }
+    if let Some(v) = file_cfg.bignum.parallel_karatsuba_threshold {
+        bn.parallel_karatsuba_threshold = v;
+    }
+    if let Some(v) = file_cfg.bignum.ntt_threshold {
+        bn.ntt_threshold = v;
+    }
+    if let Some(v) = file_cfg.bignum.newton_div_threshold {
+        bn.newton_div_threshold = v;
+    }
+    if let Some(v) = file_cfg.bignum.ntt.target_task_size {
+        bn.ntt.target_task_size = v;
+    }
+    if let Some(v) = file_cfg.bignum.ntt.parallel_pack_threshold {
+        bn.ntt.parallel_pack_threshold = v;
+    }
+    if let Some(v) = file_cfg.bignum.ntt.parallel_pointwise_threshold {
+        bn.ntt.parallel_pointwise_threshold = v;
+    }
+    if let Some(v) = file_cfg.decimal_conversion.to_string_dc_threshold {
+        bn.to_string_dc_threshold = v;
+    }
+    if let Some(v) = file_cfg.decimal_conversion.parallel_to_string_threshold {
+        bn.parallel_to_string_threshold = v;
+    }
+    if let Some(v) = file_cfg.chudnovsky.parallel_split_threshold {
+        pc.chudnovsky.parallel_split_threshold = v;
+    }
+    if let Some(v) = file_cfg.perf.default_sample_ms {
+        pc.perf.default_sample_ms = v;
+    }
+
+    bignum::config::apply(&bn);
+    pi_core::config::apply(&pc);
+
+    if file_cfg.runtime.threads > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(file_cfg.runtime.threads)
+            .build_global()
+            .with_context(|| {
+                format!(
+                    "setting rayon thread pool to {} threads",
+                    file_cfg.runtime.threads
+                )
+            })?;
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Load and apply the perf config (or defaults).  This MUST run
+    // before any rayon work — if the config requests a specific
+    // thread count, we set it once via `ThreadPoolBuilder::build_global`.
+    load_and_apply_config(cli.config.as_deref())?;
 
     if let Some(files) = cli.verify.as_deref() {
         // clap's `num_args = 2` guarantees the slice has exactly two
@@ -200,7 +346,11 @@ fn run_compute(cli: Cli) -> Result<()> {
             })?,
         None => PerfRecorder::disabled(),
     };
-    let _sampler = recorder.start_sampler(cli.performance_sample_ms);
+    // CLI flag overrides; otherwise use the perf default from config.
+    let sample_ms = cli
+        .performance_sample_ms
+        .unwrap_or_else(pi_core::config::perf_default_sample_ms);
+    let _sampler = recorder.start_sampler(sample_ms);
 
     let mut progress: Box<dyn ProgressReporter> =
         Box::new(PerfWrappedProgress::new(inner_progress, recorder.clone()));
