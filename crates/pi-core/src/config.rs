@@ -98,6 +98,26 @@ pub fn apply(c: &Config) {
     PERF_DEFAULT_SAMPLE_MS.store(c.perf.default_sample_ms, Ordering::Relaxed);
 }
 
+/// Snapshot the currently-applied configuration by reading the live
+/// atomics into a fresh `Config`.
+impl Config {
+    pub fn current() -> Self {
+        Self {
+            chudnovsky: ChudnovskyConfig {
+                parallel_split_threshold:
+                    CHUDNOVSKY_PARALLEL_SPLIT_THRESHOLD.load(Ordering::Relaxed),
+                sequential_top_threshold:
+                    CHUDNOVSKY_SEQUENTIAL_TOP_THRESHOLD.load(Ordering::Relaxed),
+                parallel_final_assembly:
+                    CHUDNOVSKY_PARALLEL_FINAL_ASSEMBLY.load(Ordering::Relaxed),
+            },
+            perf: PerfDefaults {
+                default_sample_ms: PERF_DEFAULT_SAMPLE_MS.load(Ordering::Relaxed),
+            },
+        }
+    }
+}
+
 #[inline]
 pub(crate) fn chudnovsky_parallel_split_threshold() -> u64 {
     CHUDNOVSKY_PARALLEL_SPLIT_THRESHOLD.load(Ordering::Relaxed)

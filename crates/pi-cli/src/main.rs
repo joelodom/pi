@@ -72,11 +72,12 @@ struct Cli {
     performance_sample_ms: Option<u64>,
 
     /// Path to a TOML configuration file with per-machine performance
-    /// tuning (NTT / Karatsuba thresholds, parallelism breakpoints,
-    /// rayon thread pool size, etc.).  When omitted, laptop-class
-    /// defaults are used.  See `config/laptop.toml`,
-    /// `config/server-128gb.toml`, and `config/server-massive.toml`
-    /// for examples and per-knob documentation.
+    /// tuning.  When omitted, the program auto-detects the host's RAM
+    /// and core count and applies the configuration that
+    /// `--generate-config <DIGITS>` would emit for this host and the
+    /// `--digits` target.  Pass `--config` to override the
+    /// auto-detected config (e.g. to constrain threads, lock in
+    /// benchmark settings, or reproduce a prior run).
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
 
@@ -207,14 +208,26 @@ struct PerfSection {
     default_sample_ms: Option<u64>,
 }
 
-fn load_and_apply_config(path: Option<&Path>) -> Result<()> {
+fn load_and_apply_config(path: Option<&Path>, digits: u64) -> Result<()> {
+    // Two sources, same downstream handling.  When `path` is `None`
+    // we auto-detect the host and feed the generator's TOML through
+    // the same parser as a user-supplied file — keeps a single code
+    // path for "apply this config".  When `path` is set, the user's
+    // file wins.
     let file_cfg: FileConfig = match path {
-        None => FileConfig::default(),
         Some(p) => {
             let text = std::fs::read_to_string(p)
                 .with_context(|| format!("reading config `{}`", p.display()))?;
             toml::from_str(&text)
                 .with_context(|| format!("parsing config `{}`", p.display()))?
+        }
+        None => {
+            let hw = hardware::detect();
+            let text = config_gen::generate(digits, &hw);
+            toml::from_str(&text).with_context(|| {
+                "parsing auto-generated config (this is a bug — please report)"
+                    .to_string()
+            })?
         }
     };
 
@@ -297,7 +310,7 @@ fn main() -> Result<()> {
     // Load and apply the perf config (or defaults).  This MUST run
     // before any rayon work — if the config requests a specific
     // thread count, we set it once via `ThreadPoolBuilder::build_global`.
-    load_and_apply_config(cli.config.as_deref())?;
+    load_and_apply_config(cli.config.as_deref(), cli.digits)?;
 
     if let Some(files) = cli.verify.as_deref() {
         // clap's `num_args = 2` guarantees the slice has exactly two

@@ -121,6 +121,32 @@ pub fn apply(c: &Config) {
         .store(c.ntt.parallel_pointwise_threshold, Ordering::Relaxed);
 }
 
+/// Snapshot the currently-applied configuration by reading the live
+/// atomics into a fresh `Config`.  Useful for `pi-core::perf` to
+/// capture what was active for the run; also useful in tests that
+/// want to assert post-`apply` state.
+impl Config {
+    pub fn current() -> Self {
+        Self {
+            karatsuba_threshold: KARATSUBA_THRESHOLD.load(Ordering::Relaxed),
+            parallel_karatsuba_threshold: PARALLEL_KARATSUBA_THRESHOLD
+                .load(Ordering::Relaxed),
+            ntt_threshold: NTT_THRESHOLD.load(Ordering::Relaxed),
+            newton_div_threshold: NEWTON_DIV_THRESHOLD.load(Ordering::Relaxed),
+            to_string_dc_threshold: TO_STRING_DC_THRESHOLD.load(Ordering::Relaxed),
+            parallel_to_string_threshold: PARALLEL_TO_STRING_THRESHOLD
+                .load(Ordering::Relaxed),
+            ntt: NttConfig {
+                target_task_size: NTT_TARGET_TASK_SIZE.load(Ordering::Relaxed),
+                parallel_pack_threshold: NTT_PARALLEL_PACK_THRESHOLD
+                    .load(Ordering::Relaxed),
+                parallel_pointwise_threshold: NTT_PARALLEL_POINTWISE_THRESHOLD
+                    .load(Ordering::Relaxed),
+            },
+        }
+    }
+}
+
 // =====================================================================
 // Crate-internal getters — these replace the former `const`s in
 // integer.rs and ntt.rs.  All inlined; the load is a single mov on

@@ -82,8 +82,10 @@ impl PerfRecorder {
         Self { inner: None }
     }
 
-    /// Open `path` in append mode and start recording.  Writes one
-    /// `run-start` event immediately.
+    /// Open `path` in append mode and start recording.  Writes a
+    /// `run-start` event followed by a `config` event capturing the
+    /// currently-applied bignum + pi_core configuration — every run
+    /// in the file is self-describing.
     pub fn open(path: &Path, digits: u64, algorithm: &str) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         let now = Instant::now();
@@ -95,6 +97,7 @@ impl PerfRecorder {
         });
         let rec = Self { inner: Some(inner) };
         rec.write_run_start(digits, algorithm);
+        rec.write_config_snapshot();
         Ok(rec)
     }
 
@@ -198,6 +201,61 @@ impl PerfRecorder {
         inner.write_line(&format!(
             "{{\"t_ms\":0,\"kind\":\"run-start\",\"unix_ms\":{unix_ms},\
              \"digits\":{digits},\"algorithm\":{algo_esc},\"cores\":{cores}}}"
+        ));
+    }
+
+    /// Emit the live performance configuration as a single `config`
+    /// JSONL event.  Reads from each crate's `Config::current()`
+    /// (i.e. the values currently held by the backing atomics), so
+    /// what's captured matches what the run is actually using.
+    ///
+    /// **Maintenance:** when a new performance knob is added in
+    /// `bignum::config` or `pi_core::config`, also add its field
+    /// here so analysts of the perf log see the value alongside the
+    /// other knobs.
+    fn write_config_snapshot(&self) {
+        let Some(inner) = &self.inner else { return };
+        let bn = bignum::config::Config::current();
+        let pc = crate::config::Config::current();
+        inner.write_line(&format!(
+            "{{\"t_ms\":0,\"kind\":\"config\",\
+             \"bignum\":{{\
+                \"karatsuba_threshold\":{},\
+                \"parallel_karatsuba_threshold\":{},\
+                \"ntt_threshold\":{},\
+                \"newton_div_threshold\":{},\
+                \"to_string_dc_threshold\":{},\
+                \"parallel_to_string_threshold\":{},\
+                \"ntt\":{{\
+                    \"target_task_size\":{},\
+                    \"parallel_pack_threshold\":{},\
+                    \"parallel_pointwise_threshold\":{}\
+                }}\
+             }},\
+             \"pi_core\":{{\
+                \"chudnovsky\":{{\
+                    \"parallel_split_threshold\":{},\
+                    \"sequential_top_threshold\":{},\
+                    \"parallel_final_assembly\":{}\
+                }},\
+                \"perf\":{{\
+                    \"default_sample_ms\":{}\
+                }}\
+             }}\
+            }}",
+            bn.karatsuba_threshold,
+            bn.parallel_karatsuba_threshold,
+            bn.ntt_threshold,
+            bn.newton_div_threshold,
+            bn.to_string_dc_threshold,
+            bn.parallel_to_string_threshold,
+            bn.ntt.target_task_size,
+            bn.ntt.parallel_pack_threshold,
+            bn.ntt.parallel_pointwise_threshold,
+            pc.chudnovsky.parallel_split_threshold,
+            pc.chudnovsky.sequential_top_threshold,
+            pc.chudnovsky.parallel_final_assembly,
+            pc.perf.default_sample_ms,
         ));
     }
 }
@@ -451,16 +509,20 @@ mod tests {
         let body = std::fs::read_to_string(&tmp).unwrap();
         let _ = std::fs::remove_file(&tmp);
         let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 4, "expected 4 events, got: {body:?}");
+        // Five events: run-start, config snapshot, phase-start,
+        // phase-end, run-end.
+        assert_eq!(lines.len(), 5, "expected 5 events, got: {body:?}");
         assert!(lines[0].contains("\"kind\":\"run-start\""));
         assert!(lines[0].contains("\"digits\":100"));
-        assert!(lines[1].contains("\"kind\":\"phase-start\""));
-        assert!(lines[1].contains("\"phase\":\"p1\""));
-        assert!(lines[2].contains("\"kind\":\"phase-end\""));
+        assert!(lines[1].contains("\"kind\":\"config\""));
+        assert!(lines[1].contains("\"karatsuba_threshold\""));
+        assert!(lines[2].contains("\"kind\":\"phase-start\""));
+        assert!(lines[2].contains("\"phase\":\"p1\""));
+        assert!(lines[3].contains("\"kind\":\"phase-end\""));
         // Duration is measured at runtime; assert the field is present
         // and parses to >= 10 ms (we slept 10 ms before phase_end).
-        assert!(lines[2].contains("\"duration_ms\":"), "no duration in {}", lines[2]);
-        assert!(lines[3].contains("\"kind\":\"run-end\""));
+        assert!(lines[3].contains("\"duration_ms\":"), "no duration in {}", lines[3]);
+        assert!(lines[4].contains("\"kind\":\"run-end\""));
     }
 
     #[test]
