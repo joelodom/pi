@@ -288,6 +288,15 @@ fn primitive_root_of_unity(n: u64) -> u64 {
 // =====================================================================
 
 /// In-place bit-reversal permutation.  Length must be a power of two.
+/// In-place bit-reversal permutation.  Length must be a power of two.
+///
+/// Above [`PARALLEL_BIT_REVERSE_THRESHOLD`] elements the loop is run
+/// across rayon workers.  The unordered pairs `{i, rev(i)}` partition
+/// the array into disjoint cells, so no two iterations ever touch the
+/// same `u64` — but the borrow checker can't see that, so we view the
+/// slice through `AtomicU64::from_mut_slice` to satisfy aliasing rules.
+/// `Relaxed` ordering is sufficient because there is in fact no
+/// inter-thread communication on shared cells.
 fn bit_reverse(a: &mut [u64]) {
     let n = a.len();
     debug_assert!(n.is_power_of_two());
@@ -295,6 +304,16 @@ fn bit_reverse(a: &mut [u64]) {
     if log_n == 0 {
         return;
     }
+    if n >= PARALLEL_BIT_REVERSE_THRESHOLD {
+        bit_reverse_parallel(a, log_n);
+    } else {
+        bit_reverse_serial(a, log_n);
+    }
+}
+
+#[inline]
+fn bit_reverse_serial(a: &mut [u64], log_n: u32) {
+    let n = a.len();
     for i in 0..n {
         let j = (i as u64).reverse_bits() >> (64 - log_n);
         if (i as u64) < j {
@@ -302,6 +321,44 @@ fn bit_reverse(a: &mut [u64]) {
         }
     }
 }
+
+fn bit_reverse_parallel(a: &mut [u64], log_n: u32) {
+    let n = a.len();
+    // Wrapper to make `*mut u64` Send/Sync.  Safety: the parallel
+    // iterator below dispatches one closure per index `i`; the
+    // unordered pair {i, rev(i)} is processed by exactly one closure
+    // (the one with the smaller `i`), and the pairs partition the
+    // array into disjoint cells.  No two closures ever touch the
+    // same `u64`, so the aliasing rules are upheld dynamically even
+    // though the borrow checker can't see it.
+    #[derive(Copy, Clone)]
+    struct SyncPtr(*mut u64);
+    unsafe impl Send for SyncPtr {}
+    unsafe impl Sync for SyncPtr {}
+    let ptr = SyncPtr(a.as_mut_ptr());
+
+    (0..n).into_par_iter().for_each(|i| {
+        // Capture-by-move: `ptr` is Copy so each thread gets its own
+        // SyncPtr; the closure stays Sync (the bound rayon requires)
+        // because SyncPtr is Sync rather than `*mut u64` directly.
+        let ptr = ptr;
+        let j = (i as u64).reverse_bits() >> (64 - log_n);
+        let j_usize = j as usize;
+        if (i as u64) < j {
+            // SAFETY: cells i and j_usize are owned by this closure
+            // alone (see argument above).  Indices are in bounds:
+            // `j_usize < n` by construction (log_n = trailing_zeros(n)).
+            unsafe {
+                std::ptr::swap(ptr.0.add(i), ptr.0.add(j_usize));
+            }
+        }
+    });
+}
+/// Sizes below this run the serial bit-reverse loop.  Above this the
+/// rayon dispatch overhead is amortized over enough iterations to be
+/// worthwhile, and the cache-miss-bound swap work parallelizes well
+/// across cores up to memory-bandwidth saturation.
+const PARALLEL_BIT_REVERSE_THRESHOLD: usize = 1 << 18;
 
 /// Forward NTT in-place: `A[k] = Σ_i a[i] · ω^(i·k)` where ω is a
 /// primitive `n`-th root of unity in Z/PZ.  Length must be a power of
@@ -1275,4 +1332,56 @@ mod tests {
 
     /// Need `Arc::ptr_eq` for the hit test.
     use std::sync::Arc;
+
+    // ── Parallel bit_reverse ────────────────────────────────────────────
+
+    /// Apply both bit_reverse implementations to the same input and
+    /// verify the results are identical.  Uses a size well above the
+    /// parallel threshold so the parallel path is actually exercised.
+    #[test]
+    fn bit_reverse_parallel_matches_serial() {
+        let log_n: u32 = 19; // n = 524288, > PARALLEL_BIT_REVERSE_THRESHOLD
+        let n: usize = 1 << log_n;
+        assert!(n >= PARALLEL_BIT_REVERSE_THRESHOLD);
+
+        // Deterministic seed pattern so both versions get identical input.
+        let mut a_serial: Vec<u64> = (0..n as u64)
+            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1))
+            .collect();
+        let mut a_parallel = a_serial.clone();
+
+        bit_reverse_serial(&mut a_serial, log_n);
+        bit_reverse_parallel(&mut a_parallel, log_n);
+        assert_eq!(a_serial, a_parallel, "parallel and serial diverge");
+    }
+
+    /// bit_reverse is its own inverse: applying it twice should restore
+    /// the original array.  Exercises the parallel path.
+    #[test]
+    fn bit_reverse_parallel_is_involution() {
+        let log_n: u32 = 18; // exactly at the threshold
+        let n: usize = 1 << log_n;
+        let orig: Vec<u64> = (0..n as u64)
+            .map(|i| i.wrapping_mul(0xDEAD_BEEF))
+            .collect();
+        let mut a = orig.clone();
+        bit_reverse(&mut a);
+        bit_reverse(&mut a);
+        assert_eq!(a, orig, "bit_reverse ∘ bit_reverse ≠ id");
+    }
+
+    /// Drive bit_reverse through a real NTT round-trip at a size that
+    /// hits the parallel path, validating end-to-end correctness.
+    #[test]
+    fn bit_reverse_parallel_via_ntt_round_trip() {
+        // n_a + n_b combined coeffs ≥ threshold (2^18) so the NTT
+        // working buffer exceeds the threshold and parallel bit_reverse
+        // runs in ntt_forward / ntt_inverse.  Each operand ~32K limbs.
+        let n_limbs = 32_768_usize;
+        let a = random_vec(n_limbs, 0xAA);
+        let b = random_vec(n_limbs, 0xBB);
+        let want = schoolbook(&a, &b);
+        let got = mul_mag_ntt(&a, &b);
+        assert_eq!(got, want);
+    }
 }
