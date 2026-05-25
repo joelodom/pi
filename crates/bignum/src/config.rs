@@ -69,6 +69,14 @@ pub struct NttConfig {
     /// NTT element count above which the pointwise multiply in
     /// `mul_mag_ntt` runs in parallel.
     pub parallel_pointwise_threshold: usize,
+    /// NTT transform length `N` at or above which `mul_mag_ntt`
+    /// dispatches to the four-step (Bailey matrix Fourier)
+    /// decomposition.  Below this we use the straight radix-2 NTT.
+    /// Four-step trades extra arithmetic (transpose + cross-twiddle)
+    /// for L2-resident sub-FFTs; it wins once `N` is large enough
+    /// that radix-2's late butterfly passes stride beyond cache.
+    /// Set to `usize::MAX` to disable four-step entirely.
+    pub four_step_threshold: usize,
 }
 
 
@@ -95,6 +103,11 @@ impl Default for NttConfig {
             target_task_size: 1 << 16, // 64 K u64s = 512 KB per task
             parallel_pack_threshold: 1024,
             parallel_pointwise_threshold: 1024,
+            // 2^20 = ~1 M elements (8 MiB).  Above this, the late
+            // radix-2 butterfly passes have strides well beyond L2
+            // on typical hardware (Graviton 2/3 = 1 MiB L2/core);
+            // four-step's sub-FFTs become cache-resident and win.
+            four_step_threshold: 1 << 20,
         }
     }
 }
@@ -112,6 +125,7 @@ static PARALLEL_TO_STRING_THRESHOLD: AtomicUsize = AtomicUsize::new(256);
 static NTT_TARGET_TASK_SIZE: AtomicUsize = AtomicUsize::new(1 << 16);
 static NTT_PARALLEL_PACK_THRESHOLD: AtomicUsize = AtomicUsize::new(1024);
 static NTT_PARALLEL_POINTWISE_THRESHOLD: AtomicUsize = AtomicUsize::new(1024);
+static NTT_FOUR_STEP_THRESHOLD: AtomicUsize = AtomicUsize::new(1 << 20);
 static DISK_LIMB_THRESHOLD: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// Push a [`Config`] into the live atomics.  Call this once at
@@ -131,6 +145,7 @@ pub fn apply(c: &Config) {
         .store(c.ntt.parallel_pack_threshold, Ordering::Relaxed);
     NTT_PARALLEL_POINTWISE_THRESHOLD
         .store(c.ntt.parallel_pointwise_threshold, Ordering::Relaxed);
+    NTT_FOUR_STEP_THRESHOLD.store(c.ntt.four_step_threshold, Ordering::Relaxed);
     DISK_LIMB_THRESHOLD.store(c.disk_limb_threshold, Ordering::Relaxed);
 }
 
@@ -155,6 +170,7 @@ impl Config {
                     .load(Ordering::Relaxed),
                 parallel_pointwise_threshold: NTT_PARALLEL_POINTWISE_THRESHOLD
                     .load(Ordering::Relaxed),
+                four_step_threshold: NTT_FOUR_STEP_THRESHOLD.load(Ordering::Relaxed),
             },
             disk_limb_threshold: DISK_LIMB_THRESHOLD.load(Ordering::Relaxed),
         }
@@ -215,6 +231,19 @@ pub(crate) fn ntt_parallel_pack_threshold() -> usize {
 #[inline]
 pub(crate) fn ntt_parallel_pointwise_threshold() -> usize {
     NTT_PARALLEL_POINTWISE_THRESHOLD.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub(crate) fn ntt_four_step_threshold() -> usize {
+    NTT_FOUR_STEP_THRESHOLD.load(Ordering::Relaxed)
+}
+
+/// Test-only setter for the four-step threshold; lets tests force the
+/// four-step path on small inputs.  Restore the previous value before
+/// the test ends to keep other tests independent.
+#[cfg(test)]
+pub(crate) fn set_ntt_four_step_threshold_for_test(v: usize) -> usize {
+    NTT_FOUR_STEP_THRESHOLD.swap(v, Ordering::Relaxed)
 }
 
 #[cfg(test)]

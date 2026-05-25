@@ -67,6 +67,20 @@ pub fn generate(digits: u64, hw: &HardwareProfile) -> String {
         _ => 16_384,
     };
 
+    // Four-step (Bailey matrix Fourier) NTT crossover.  We engage
+    // four-step once the radix-2 late butterfly passes start striding
+    // beyond L2.  Graviton 2/3/4 have ≈1 MiB L2 per core; for an N-
+    // length transform the last pass strides N/2 elements (8N bytes),
+    // so it busts L2 around N ≈ 2^17.  The transition-zone overhead
+    // of four-step (transposes + cross-twiddle) wants a bit of slack,
+    // so we use 8× that breakeven on small core counts and tighter on
+    // many-core hosts where the cache effects bite harder.
+    let four_step_threshold: usize = match cores {
+        0..=12 => 1 << 20, // 1 M elements ≈ 8 MiB
+        13..=64 => 1 << 19, // 512 K
+        _ => 1 << 18,       // 256 K — many-core hosts hit cache pressure earlier
+    };
+
     // chudnovsky.parallel_split_threshold: lower on many-core boxes.
     let parallel_split_threshold = match cores {
         0..=12 => 64,
@@ -196,6 +210,13 @@ pub fn generate(digits: u64, hw: &HardwareProfile) -> String {
     writeln!(s, "# across a wide core range.").unwrap();
     writeln!(s, "parallel_pack_threshold = 1024").unwrap();
     writeln!(s, "parallel_pointwise_threshold = 1024").unwrap();
+    writeln!(s).unwrap();
+    writeln!(s, "# Four-step (Bailey matrix Fourier) NTT crossover.  Above this transform").unwrap();
+    writeln!(s, "# length, the late radix-2 butterfly passes stride beyond L2 cache and").unwrap();
+    writeln!(s, "# four-step's √N sub-FFTs become cache-resident.  Picked {four_step_threshold}").unwrap();
+    writeln!(s, "# for this {cores}-core host (≈{} KiB working set per sub-FFT).",
+        ((four_step_threshold as f64).sqrt() as usize) * 8 / 1024).unwrap();
+    writeln!(s, "four_step_threshold = {four_step_threshold}").unwrap();
     writeln!(s).unwrap();
 
     // [chudnovsky]

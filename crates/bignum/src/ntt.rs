@@ -825,9 +825,23 @@ pub(crate) fn mul_mag_ntt(a: &[u64], b: &[u64]) -> Vec<u64> {
     rayon::join(|| pack(a, &mut pa), || pack(b, &mut pb));
 
     // Forward transforms — also independent, also internally parallel.
-    rayon::join(|| ntt_forward(&mut pa), || ntt_forward(&mut pb));
+    // Above the four-step threshold the late radix-2 butterfly passes
+    // stride beyond L2; dispatch to four-step to keep sub-FFTs cache-
+    // resident.  Forward, inverse, and the pointwise multiply must all
+    // see the same data layout, so the choice is per-multiplication
+    // (not per-NTT-call).
+    let use_four_step = n >= crate::config::ntt_four_step_threshold();
+    if use_four_step {
+        rayon::join(
+            || four_step::forward(&mut pa),
+            || four_step::forward(&mut pb),
+        );
+    } else {
+        rayon::join(|| ntt_forward(&mut pa), || ntt_forward(&mut pb));
+    }
 
     // Pointwise multiply: each lane independent, perfectly parallel.
+    // Layout doesn't matter as long as forward(a) and forward(b) agree.
     if n >= crate::config::ntt_parallel_pointwise_threshold() {
         pa.par_iter_mut().zip(pb.par_iter()).for_each(|(x, y)| {
             *x = mul(*x, *y);
@@ -841,10 +855,15 @@ pub(crate) fn mul_mag_ntt(a: &[u64], b: &[u64]) -> Vec<u64> {
     // NTT's own temporaries (and the next mul_mag_ntt) can reuse it.
     drop(pb);
 
-    ntt_inverse(&mut pa);
+    if use_four_step {
+        four_step::inverse(&mut pa);
+    } else {
+        ntt_inverse(&mut pa);
+    }
 
     unpack(&pa[..n_out])
 }
+
 
 
 
@@ -1982,5 +2001,66 @@ mod tests {
         for i in 0..n { a[i] = mul(a[i], b[i]); }
         super::four_step::inverse(&mut a);
         assert_eq!(a, want);
+    }
+
+    // ── mul_mag_ntt dispatch into four-step ─────────────────────────────
+    //
+    // These tests force the four-step branch by lowering the global
+    // `NTT_FOUR_STEP_THRESHOLD` for the duration of the test, then
+    // restore the previous value.  Tests serialise on a mutex so the
+    // shared atomic isn't toggled mid-run by another test.
+
+    use std::sync::Mutex;
+    static FOUR_STEP_THRESHOLD_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Force the four-step branch by lowering the threshold to 1
+    /// (any non-trivial N triggers).  Multiply via mul_mag_ntt and
+    /// compare against the schoolbook reference.
+    #[test]
+    fn mul_mag_ntt_dispatches_to_four_step_when_threshold_low() {
+        let _guard = FOUR_STEP_THRESHOLD_LOCK.lock().unwrap();
+        let prev = crate::config::set_ntt_four_step_threshold_for_test(1);
+
+        // 300-limb operands → n_out ≈ 2400 coeffs → N = 4096.  The
+        // four-step branch will engage because threshold=1.
+        let a = random_vec(300, 0x1357);
+        let b = random_vec(300, 0x2468);
+        let want = schoolbook(&a, &b);
+        let got = mul_mag_ntt(&a, &b);
+        assert_eq!(got, want, "four-step convolution mismatch");
+
+        crate::config::set_ntt_four_step_threshold_for_test(prev);
+    }
+
+    /// Sanity: with the threshold restored to its high default, the
+    /// same input should take the radix-2 path and produce the same
+    /// answer.
+    #[test]
+    fn mul_mag_ntt_radix2_baseline_matches() {
+        // No threshold override; default is high so radix-2 wins.
+        let a = random_vec(300, 0x1357);
+        let b = random_vec(300, 0x2468);
+        let want = schoolbook(&a, &b);
+        let got = mul_mag_ntt(&a, &b);
+        assert_eq!(got, want);
+    }
+
+    /// Non-square N path through mul_mag_ntt — force four-step on
+    /// inputs that produce an odd-log₂ transform length.
+    #[test]
+    fn mul_mag_ntt_four_step_nonsquare_branch() {
+        let _guard = FOUR_STEP_THRESHOLD_LOCK.lock().unwrap();
+        let prev = crate::config::set_ntt_four_step_threshold_for_test(1);
+
+        // 400-limb operands → n_out ≈ 3200 coeffs → N = 4096 (square).
+        // To hit an odd log₂(N), use sizes that round up to 8192.
+        // 600 limbs → n_out ≈ 4800 → N = 8192 (log₂ = 13, odd).
+        let a = random_vec(600, 0xAB);
+        let b = random_vec(600, 0xCD);
+        let want = schoolbook(&a, &b);
+        let got = mul_mag_ntt(&a, &b);
+        assert_eq!(got, want, "four-step non-square convolution mismatch");
+
+        crate::config::set_ntt_four_step_threshold_for_test(prev);
     }
 }

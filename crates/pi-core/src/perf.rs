@@ -253,7 +253,8 @@ impl PerfRecorder {
                 \"ntt\":{{\
                     \"target_task_size\":{},\
                     \"parallel_pack_threshold\":{},\
-                    \"parallel_pointwise_threshold\":{}\
+                    \"parallel_pointwise_threshold\":{},\
+                    \"four_step_threshold\":{}\
                 }}\
              }},\
              \"pi_core\":{{\
@@ -277,6 +278,7 @@ impl PerfRecorder {
             bn.ntt.target_task_size,
             bn.ntt.parallel_pack_threshold,
             bn.ntt.parallel_pointwise_threshold,
+            bn.ntt.four_step_threshold,
             pc.chudnovsky.parallel_split_threshold,
             pc.chudnovsky.sequential_top_threshold,
             pc.chudnovsky.parallel_final_assembly,
