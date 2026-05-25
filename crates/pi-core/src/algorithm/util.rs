@@ -8,6 +8,7 @@ use anyhow::{anyhow, Result};
 use bignum::{Float, Integer, PowAssign, Round};
 
 use crate::output::DigitSink;
+use crate::progress::ProgressReporter;
 
 /// Render `pi` to exactly `digits` decimal digits (counting the leading
 /// `3`) and stream them through `sink`.
@@ -25,31 +26,40 @@ pub(super) fn write_decimal_digits(
     mut pi: Float,
     digits: u64,
     sink: &mut dyn DigitSink,
+    progress: &mut dyn ProgressReporter,
 ) -> Result<()> {
     // Build the scale 10^(digits - 1) at the same working precision.
+    progress.milestone("dc.scale_build.start");
     let prec = pi.prec_64();
     let mut scale = Float::with_val_64(prec, 10);
     let exp = Integer::from(digits) - 1_u32;
     scale.pow_assign(&exp);
     drop(exp);
+    progress.milestone("dc.scale_build.end");
 
     // Scale `pi` in place — `pi *= &scale` reuses pi's mantissa
     // allocation, then we immediately drop `scale` (full-precision
     // Float, multi-GB at scale).
+    progress.milestone("dc.scale_mul.start");
     pi *= &scale;
     drop(scale);
+    progress.milestone("dc.scale_mul.end");
 
     // Truncate (round toward -∞ — for positive pi the same as floor and
     // the same as `trunc`).  Float::to_integer rounds to nearest, which
     // would give the wrong answer for "the first N digits of pi"
     // whenever the digit just past the cut is ≥ 5.
+    progress.milestone("dc.to_integer.start");
     let (int_part, _ord) = pi
         .to_integer_round(Round::Down)
         .ok_or_else(|| anyhow!("pi scaled to integer was non-finite"))?;
     drop(pi);
+    progress.milestone("dc.to_integer.end");
 
+    progress.milestone("dc.to_string.start");
     let mut s = int_part.to_string();
     drop(int_part);
+    progress.milestone("dc.to_string.end");
 
     let want = digits as usize;
     match s.len().cmp(&want) {

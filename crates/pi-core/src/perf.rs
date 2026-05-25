@@ -177,6 +177,29 @@ impl PerfRecorder {
         }
     }
 
+    /// Instantaneous sub-phase marker.  Emits a `milestone` event tagged
+    /// with the current phase (if any) and a free-form label.  Used by
+    /// algorithms to delineate internal boundaries like `fa.sqrt_join`,
+    /// `fa.final_mul`, `dc.scale_mul` so post-hoc analysis can decompose
+    /// phase wall time without recompiling.
+    pub fn milestone(&self, label: &str) {
+        if let Some(inner) = &self.inner {
+            let t = inner.elapsed_ms();
+            let phase_name = inner
+                .current_phase
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(n, _)| n.clone())
+                .unwrap_or_default();
+            let phase_esc = json_escape(&phase_name);
+            let label_esc = json_escape(label);
+            inner.write_line(&format!(
+                "{{\"t_ms\":{t},\"kind\":\"milestone\",\"phase\":{phase_esc},\"label\":{label_esc}}}"
+            ));
+        }
+    }
+
     /// Emit a final `run-end` event with totals.  Called at end of
     /// CLI run.  Optional; nothing else depends on it.
     pub fn run_end(&self) {
@@ -280,6 +303,19 @@ impl Inner {
         let t = self.elapsed_ms();
         let rss_bytes = read_rss_bytes();
         let rss_mb = rss_bytes / (1024 * 1024);
+        // VmSwap from /proc/self/status on Linux; 0 elsewhere.  Tells
+        // us if the kernel has actually moved pages to swap (different
+        // from page-cache eviction of file-backed mmap regions, which
+        // doesn't count as swap).  Should remain 0 on EC2 (no swap).
+        let swap_mb = read_swap_bytes() / (1024 * 1024);
+        // /proc/self/io counters (Linux only; 0 elsewhere).
+        // - rchar/wchar: bytes read/written via syscalls, including
+        //   page-cache hits.
+        // - read_bytes/write_bytes: bytes that actually crossed the
+        //   block-device boundary.
+        // For a disk-backed run: read_bytes > 0 means real disk I/O;
+        // rchar - read_bytes ≈ how much was served from page cache.
+        let io = read_io_counters();
 
         // One snapshot fills both the cpu-delta calculation and the
         // cumulative-counter fields below — getrusage is called once.
@@ -320,9 +356,12 @@ impl Inner {
         self.write_line(&format!(
             "{{\"t_ms\":{t},\"kind\":\"sample\",\"phase\":{phase_esc},\
              \"rss_mb\":{rss_mb},\"peak_rss_mb\":{peak_rss_mb},\
+             \"swap_mb\":{swap_mb},\
              \"cpu_cores\":{cpu_cores:.3},\
              \"minor_faults\":{},\"major_faults\":{},\
              \"ctx_voluntary\":{},\"ctx_involuntary\":{},\
+             \"io_rchar\":{},\"io_wchar\":{},\
+             \"io_read_bytes\":{},\"io_write_bytes\":{},\
              \"mmap_bytes_live\":{mmap_bytes_live},\
              \"mmap_count_live\":{mmap_count_live},\
              \"mmap_bytes_total\":{mmap_bytes_total},\
@@ -331,6 +370,10 @@ impl Inner {
             now.major_faults,
             now.ctx_voluntary,
             now.ctx_involuntary,
+            io.rchar,
+            io.wchar,
+            io.read_bytes,
+            io.write_bytes,
         ));
     }
 }
@@ -456,6 +499,70 @@ fn num_cpus_get() -> usize {
     // Use rayon's view of the global pool — that's what actually
     // governs our parallelism, and it respects RAYON_NUM_THREADS.
     rayon::current_num_threads()
+}
+
+/// Bytes the kernel has actually moved to swap, or 0 if unavailable.
+/// EC2 instances run swapless by default — should always be 0 there.
+#[cfg(target_os = "linux")]
+fn read_swap_bytes() -> u64 {
+    let s = match std::fs::read_to_string("/proc/self/status") {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("VmSwap:") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if let Some(n) = parts.first() {
+                if let Ok(kib) = n.parse::<u64>() {
+                    return kib * 1024;
+                }
+            }
+        }
+    }
+    0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_swap_bytes() -> u64 {
+    0
+}
+
+/// Per-process I/O counters from `/proc/self/io`.  Distinguishes
+/// page-cache hits (rchar - read_bytes) from real disk reads
+/// (read_bytes).  All fields are cumulative since process start.
+#[derive(Default)]
+struct IoCounters {
+    rchar: u64,
+    wchar: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn read_io_counters() -> IoCounters {
+    let s = match std::fs::read_to_string("/proc/self/io") {
+        Ok(s) => s,
+        Err(_) => return IoCounters::default(),
+    };
+    let mut out = IoCounters::default();
+    for line in s.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(key), Some(val)) = (it.next(), it.next()) else { continue };
+        let n: u64 = val.parse().unwrap_or(0);
+        match key {
+            "rchar:" => out.rchar = n,
+            "wchar:" => out.wchar = n,
+            "read_bytes:" => out.read_bytes = n,
+            "write_bytes:" => out.write_bytes = n,
+            _ => {}
+        }
+    }
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_io_counters() -> IoCounters {
+    IoCounters::default()
 }
 
 /// JSON-escape a string and wrap it in double quotes.  Conservative —

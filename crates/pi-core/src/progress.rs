@@ -33,6 +33,12 @@ pub trait ProgressReporter {
 
     /// Called when the current phase ends.
     fn end_phase(&mut self);
+
+    /// Instantaneous sub-phase marker within the current phase.  Lets
+    /// algorithms label internal boundaries (e.g. FA's recip vs sqrt
+    /// vs final_mul) without disturbing phase tracking.  Default is a
+    /// no-op so non-perf reporters can ignore it.
+    fn milestone(&mut self, _label: &str) {}
 }
 
 /// A [`ProgressReporter`] that does nothing.  Suitable for library callers

@@ -739,4 +739,9 @@ impl ProgressReporter for PerfWrappedProgress {
         self.recorder.phase_end();
         self.inner.end_phase();
     }
+
+    fn milestone(&mut self, label: &str) {
+        self.recorder.milestone(label);
+        self.inner.milestone(label);
+    }
 }

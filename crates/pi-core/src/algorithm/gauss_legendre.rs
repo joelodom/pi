@@ -157,7 +157,7 @@ impl PiAlgorithm for GaussLegendre {
 
         // --- Decimal conversion --------------------------------------------
         progress.start_phase(PHASE_DECIMAL_CONVERSION, 1);
-        write_decimal_digits(pi, digits, sink)?;
+        write_decimal_digits(pi, digits, sink, progress)?;
         progress.tick();
         progress.end_phase();
 

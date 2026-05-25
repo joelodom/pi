@@ -142,11 +142,13 @@ impl PiAlgorithm for Chudnovsky {
             // precision-doubling Newton on the integer denominator.
             // Running them on separate rayon worker threads halves the
             // serial chain at the top of final assembly.
+            progress.milestone("fa.denom_construct.start");
             let denom_int = Integer::from(A) * &q + &t;
             // t is no longer needed — free its mantissa now (hundreds
             // of MB at billion-digit scale) before the NTT-heavy work
             // below allocates its scratch buffers.
             drop(t);
+            progress.milestone("fa.denom_construct.end");
             progress.tick();
 
             // `denom_int` is consumed by `.into()` so its memory
@@ -155,10 +157,15 @@ impl PiAlgorithm for Chudnovsky {
 
             // Wait for the background sqrt thread (started before BS).
             // At scale this returns immediately; the sqrt finished
-            // during the parallel lower-tree levels of BS.
+            // during the parallel lower-tree levels of BS.  If the
+            // sqrt was NOT done (e.g. BS finished early at small N),
+            // this `join` will block — `fa.sqrt_join.{start,end}`
+            // tells the analyst exactly how long the wait was.
+            progress.milestone("fa.sqrt_join.start");
             let sqrt_426880 = sqrt_handle
                 .join()
                 .expect("chudnovsky-sqrt thread panicked");
+            progress.milestone("fa.sqrt_join.end");
 
             // Two chains compute pi_numer (sqrt · 426880 · q, where the
             // sqrt · 426880 factor is precomputed in the background
@@ -168,6 +175,7 @@ impl PiAlgorithm for Chudnovsky {
             // sequentially holds only one chain's Float intermediates
             // live at a time (saves multi-GB peak at billion-digit
             // scale).  Knob lives in chudnovsky.parallel_final_assembly.
+            progress.milestone("fa.parallel_chains.start");
             let (recip, pi_numer) = if crate::config::chudnovsky_parallel_final_assembly() {
                 rayon::join(
                     || denom_float.reciprocal_at_prec(prec + 16),
@@ -183,6 +191,7 @@ impl PiAlgorithm for Chudnovsky {
                 p *= &q;
                 (recip, p)
             };
+            progress.milestone("fa.parallel_chains.end");
             // Once both chains have returned, neither `q` nor
             // `denom_float` is referenced again.  Drop them before the
             // final multiply so its NTT buffers don't stack on top of
@@ -191,12 +200,14 @@ impl PiAlgorithm for Chudnovsky {
             drop(denom_float);
             progress.tick();
 
+            progress.milestone("fa.final_mul.start");
             let pi = pi_numer.mul_at_prec(&recip, prec);
             // Free the two operands of the final multiply now that the
             // result is built — keeps peak below `recip + pi_numer +
             // pi` (which is 3 full-precision Floats).
             drop(pi_numer);
             drop(recip);
+            progress.milestone("fa.final_mul.end");
             progress.tick();
             progress.end_phase();
             pi
@@ -204,7 +215,7 @@ impl PiAlgorithm for Chudnovsky {
         };
 
         progress.start_phase(PHASE_DECIMAL_CONVERSION, 1);
-        write_decimal_digits(pi, digits, sink)?;
+        write_decimal_digits(pi, digits, sink, progress)?;
         progress.tick();
         progress.end_phase();
 
