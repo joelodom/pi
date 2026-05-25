@@ -100,7 +100,77 @@ Memory scaling is roughly linear with digits (matches the generator's
 5.4 GB / 100M model); wall time is roughly linear at this scale on
 2 cores (no NTT cache effects yet because N stays under L3).
 
+### Update 2026-05-25 (later) — four-step NTT session
+
+Followed up with the four-step (Bailey matrix Fourier) decomposition
+that was the single biggest "deferred" item.  Five commits:
+
+```
+c72ce0e bignum: square-N four-step NTT (Bailey matrix Fourier decomposition)
+4be3dc3 bignum: four-step NTT generalised to non-square N
+90e1f10 bignum/pi: wire four-step NTT into mul_mag_ntt with a size threshold
+b760992 bignum: raise four-step default threshold to 2^25 after perf check
+0ec22c3 bignum: parallelize four-step transposes, twiddle, and sub-FFT loops
+```
+
+**Algorithm shape.**  Six-step matrix decomposition: transpose →
+row-FFT (length √N or N1) → cross-twiddle `ω_N^(s·i)` → transpose →
+row-FFT (length √N or N2).  Sub-FFTs are existing radix-2
+`ntt_forward` / `ntt_inverse`, so they pick up parallel butterflies,
+twiddle cache, and parallel bit-reverse automatically.  Output lives
+in a "digit-reversed" layout vs radix-2; correctness is validated by
+round-trip identity and convolution-matches-naive, not by direct
+output comparison.
+
+**Tests.**  17 new tests covering round-trip + convolution at sizes
+N ∈ {4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048} (both square and
+non-square log₂(N)), plus dispatch tests through `mul_mag_ntt` that
+force the path via a `#[cfg(test)]` threshold setter.  All 99 bignum
+tests pass.
+
+**Empirical result on this 2-core host at 10M digits:**
+
+| Config                              | Wall time | Δ vs radix-2 |
+|-------------------------------------|----------:|-------------:|
+| Radix-2 only (default)              | 78–81 s   |   baseline   |
+| Four-step engaged, serial helpers   | 102 s     |  +28 %       |
+| Four-step engaged, parallel helpers | 88 s      |  +13 %       |
+
+At N=2^21 (the top-of-tree mult at 10M digits), four-step loses on
+this hardware even after parallelizing all the supporting work.
+The fixed costs (3 transposes, cross-twiddle table, 2·√N sub-FFT
+dispatches) don't amortise — only the last few radix-2 passes were
+actually cache-bound, so the cache win is small.
+
+**Where four-step *should* win** (untested — needs production
+hardware):
+
+* N ≥ 2^27, where radix-2 late passes have strides of multi-GB and
+  every access is a guaranteed DRAM round trip.
+* High core count (64+), where the √N independent sub-FFTs can each
+  run on their own core in parallel.
+* 100B-digit runs (Karatsuba-above-NTT leaves at N=2^31) — these
+  are exactly the regime where four-step's cache locality should
+  dominate.
+
+**Default threshold (`bignum.ntt.four_step_threshold`):**
+
+| Cores  | Default        | Working-set hint  |
+|--------|----------------|-------------------|
+| ≤ 12   | 2^26           | ≈ 512 MiB         |
+| 13–64  | 2^25           | ≈ 256 MiB         |
+| > 64   | 2^24           | ≈ 128 MiB         |
+
+These can all be lowered via `--config` once benchmark evidence
+shows it pays off at a specific (host, N) pair.
+
+**Startup banner** (uncommitted pending user trial) now surfaces
+the threshold and a "DISK-BACKED above X limbs" vs "RAM only" line
+so it's obvious from the first 30 lines of stderr what regime a
+run is in.
+
 ### Suggested next steps (not done — too risky for unattended)
+
 
 1. **Four-step / cache-blocked NTT** (the deferred `√N × √N` matrix
    decomposition called out in `ntt.rs`'s module doc).  This is the
