@@ -32,6 +32,131 @@
 use rayon::prelude::*;
 
 // =====================================================================
+// Scratch buffer pool
+// =====================================================================
+//
+// `mul_mag_ntt` allocates two N-sized `Vec<u64>` scratch buffers per
+// call.  At large N (e.g. 2^31 — 16 GB each) those allocations dominate
+// peak RSS variance and add real allocator latency at the top of the
+// binary-splitting tree.  The pool keeps a small number of recently-
+// released buffers per exact size and hands them back on the next
+// `acquire`, falling back to fresh allocation when empty.
+//
+// Buffer contents on acquire are stale (whatever the previous user
+// left).  `pack` zeros the tail after writing the live coefficients,
+// and the NTT routines always overwrite every cell they read.  So
+// callers do not need to pre-zero — but any future user that *reads*
+// before writing MUST zero first.
+
+mod pool {
+    use std::collections::BTreeMap;
+    use std::ops::{Deref, DerefMut};
+    use std::sync::Mutex;
+
+    /// Per-size cap for ordinary buffers (kilobytes to ~100 MB each).
+    const MAX_PER_SIZE: usize = 4;
+    /// Per-size cap for very large buffers (≥ 1 GiB per buffer).  At
+    /// 100B pi digits we may juggle several 16 GB scratch arrays; one
+    /// cached copy per size is plenty and avoids exhausting RAM on
+    /// memory-constrained hosts.
+    const MAX_PER_HUGE_SIZE: usize = 1;
+    /// 2^27 u64 = 1 GiB.  Above this, the huge-buffer cap applies.
+    const HUGE_SIZE_THRESHOLD: usize = 1 << 27;
+
+    struct Pool {
+        by_size: BTreeMap<usize, Vec<Vec<u64>>>,
+    }
+
+    impl Pool {
+        const fn new() -> Self {
+            Self {
+                by_size: BTreeMap::new(),
+            }
+        }
+
+        fn pop(&mut self, n: usize) -> Option<Vec<u64>> {
+            self.by_size.get_mut(&n).and_then(|v| v.pop())
+        }
+
+        fn push(&mut self, buf: Vec<u64>) {
+            let n = buf.len();
+            let cap = if n >= HUGE_SIZE_THRESHOLD {
+                MAX_PER_HUGE_SIZE
+            } else {
+                MAX_PER_SIZE
+            };
+            let bucket = self.by_size.entry(n).or_default();
+            if bucket.len() < cap {
+                bucket.push(buf);
+            }
+            // else: drop `buf`; allocator reclaims the memory.
+        }
+    }
+
+    static POOL: Mutex<Pool> = Mutex::new(Pool::new());
+
+    /// RAII handle for an `n`-element scratch buffer.  Returns the
+    /// buffer to the pool on drop (panic-safe via stack unwind).
+    pub(crate) struct ScratchBuf {
+        buf: Option<Vec<u64>>,
+    }
+
+    impl ScratchBuf {
+        /// Acquire a buffer of exactly `n` `u64`s.  Reuses a pooled
+        /// buffer at this exact size when available; otherwise
+        /// allocates fresh.  Contents are stale on return — overwrite
+        /// before reading.
+        pub(crate) fn acquire(n: usize) -> Self {
+            let buf = POOL
+                .lock()
+                .expect("scratch pool poisoned")
+                .pop(n)
+                .unwrap_or_else(|| vec![0u64; n]);
+            debug_assert_eq!(buf.len(), n);
+            Self { buf: Some(buf) }
+        }
+    }
+
+    impl Drop for ScratchBuf {
+        fn drop(&mut self) {
+            if let Some(buf) = self.buf.take() {
+                // If the mutex is poisoned, fall through — the buffer
+                // will simply be deallocated rather than pooled.
+                if let Ok(mut pool) = POOL.lock() {
+                    pool.push(buf);
+                }
+            }
+        }
+    }
+
+    impl Deref for ScratchBuf {
+        type Target = Vec<u64>;
+        fn deref(&self) -> &Self::Target {
+            self.buf.as_ref().expect("ScratchBuf already dropped")
+        }
+    }
+
+    impl DerefMut for ScratchBuf {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            self.buf.as_mut().expect("ScratchBuf already dropped")
+        }
+    }
+
+    /// Test-only inspection: how many buffers are pooled at size `n`.
+    #[cfg(test)]
+    pub(crate) fn pooled_count_at_size(n: usize) -> usize {
+        POOL.lock()
+            .unwrap()
+            .by_size
+            .get(&n)
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+}
+
+use pool::ScratchBuf;
+
+// =====================================================================
 // Goldilocks field: P = 2^64 - 2^32 + 1
 // =====================================================================
 
@@ -423,10 +548,12 @@ pub(crate) fn mul_mag_ntt(a: &[u64], b: &[u64]) -> Vec<u64> {
         "mul_mag_ntt called with N={n} > 2^32; mul_mag should have split this"
     );
 
-    let mut pa = vec![0u64; n];
-    let mut pb = vec![0u64; n];
+    let mut pa = ScratchBuf::acquire(n);
+    let mut pb = ScratchBuf::acquire(n);
     // Pack both inputs in parallel — the two passes are independent and
     // each one is itself internally parallel above the pack threshold.
+    // `pack` zeros the tail of its destination, so it's safe to reuse
+    // pooled buffers without pre-zeroing.
     rayon::join(|| pack(a, &mut pa), || pack(b, &mut pb));
 
     // Forward transforms — also independent, also internally parallel.
@@ -442,14 +569,15 @@ pub(crate) fn mul_mag_ntt(a: &[u64], b: &[u64]) -> Vec<u64> {
             *x = mul(*x, *y);
         }
     }
-    // pb no longer needed.  Free its half-gigabyte mantissa space
-    // before the inverse NTT does its own temporary allocations.
+    // pb no longer needed.  Drop returns it to the pool so the inverse
+    // NTT's own temporaries (and the next mul_mag_ntt) can reuse it.
     drop(pb);
 
     ntt_inverse(&mut pa);
 
     unpack(&pa[..n_out])
 }
+
 
 // `parallel_pointwise_threshold` lives in crate::config.
 
@@ -833,5 +961,85 @@ mod tests {
         let want = schoolbook(&a, &b);
         let got = mul_mag_ntt(&a, &b);
         assert_eq!(got, want);
+    }
+
+    // ── Scratch buffer pool ─────────────────────────────────────────────
+
+    /// Acquire / drop / acquire-again on the same size should reuse the
+    /// pooled buffer rather than allocating a fresh one.
+    #[test]
+    fn pool_reuses_released_buffer_at_same_size() {
+        // Pick a size that no other concurrent test is using, to keep
+        // the per-size bucket count predictable.  Tests run in parallel
+        // by default; choose an oddball value that won't be hit by
+        // mul_mag_ntt's power-of-two buffers.
+        let n = 12_345_usize;
+
+        // Drain any leftover buffers at this size class so the count
+        // starts at zero from this test's perspective.
+        while pool::pooled_count_at_size(n) > 0 {
+            let _ = ScratchBuf::acquire(n);
+        }
+        assert_eq!(pool::pooled_count_at_size(n), 0);
+
+        // Acquire then drop: buffer goes into the pool.
+        let buf = ScratchBuf::acquire(n);
+        assert_eq!(buf.len(), n);
+        drop(buf);
+        assert_eq!(pool::pooled_count_at_size(n), 1);
+
+        // Next acquire should pull from the pool, leaving it empty.
+        let _buf2 = ScratchBuf::acquire(n);
+        assert_eq!(pool::pooled_count_at_size(n), 0);
+    }
+
+    /// Repeated mul_mag_ntt calls of the same size should drive pool
+    /// reuse: after several calls the pool should hold at most the
+    /// per-size cap, not one buffer per call.
+    #[test]
+    fn pool_caps_at_max_per_size_under_repeated_ntt() {
+        // Use small inputs so this test is fast.  Each call needs
+        // n = next_power_of_two((|a| + |b|) * 4); with 200-limb
+        // inputs, n = 2048.
+        let a = random_vec(200, 0x1234_5678_9abc_def0);
+        let b = random_vec(200, 0x0fed_cba9_8765_4321);
+
+        // Run several mul_mag_ntts in sequence.  Each one acquires
+        // and releases two buffers of size 2048.
+        for _ in 0..10 {
+            let _ = mul_mag_ntt(&a, &b);
+        }
+
+        // Pool cap for ordinary sizes is 4.  Bucket should not exceed
+        // that, regardless of how many calls we made.
+        assert!(
+            pool::pooled_count_at_size(2048) <= 4,
+            "pool exceeded MAX_PER_SIZE cap"
+        );
+    }
+
+    /// Pooled buffer reuse must not corrupt results: run the same
+    /// multiplication twice and compare both to schoolbook.  The
+    /// second call exercises whatever buffers the first one returned.
+    #[test]
+    fn pool_reuse_preserves_correctness() {
+        let a = random_vec(300, 0xcafe_0001);
+        let b = random_vec(300, 0xbeef_0002);
+        let want = schoolbook(&a, &b);
+
+        let first = mul_mag_ntt(&a, &b);
+        assert_eq!(first, want);
+
+        // Second call should pick up the pooled buffer from the first.
+        let second = mul_mag_ntt(&a, &b);
+        assert_eq!(second, want);
+
+        // And a different-but-same-size input must also be correct,
+        // since the scratch buffer comes back stale.
+        let c = random_vec(300, 0xdead_0003);
+        let d = random_vec(300, 0xface_0004);
+        let want_cd = schoolbook(&c, &d);
+        let got_cd = mul_mag_ntt(&c, &d);
+        assert_eq!(got_cd, want_cd);
     }
 }
