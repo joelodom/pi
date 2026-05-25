@@ -885,87 +885,108 @@ pub(crate) fn mul_mag_ntt(a: &[u64], b: &[u64]) -> Vec<u64> {
 
 mod four_step {
     use super::{
-        add, inv, mul, ntt_forward, ntt_inverse, primitive_root_of_unity,
+        inv, mul, ntt_forward, ntt_inverse, primitive_root_of_unity, ScratchBuf,
     };
 
-    /// Square-N forward four-step.  `a.len()` must be a power of two
-    /// and `log₂(a.len())` must be even (so N is a perfect square).
-    pub(super) fn forward_square(a: &mut [u64]) {
+    /// Forward four-step NTT for any power-of-two `N`.  When N is a
+    /// perfect square (log₂(N) even) the transpose is in-place;
+    /// otherwise we pick N1 = 2^⌊k/2⌋, N2 = 2^⌈k/2⌉ and use a pooled
+    /// scratch buffer for the non-square transposes.
+    pub(super) fn forward(a: &mut [u64]) {
         let n = a.len();
-        let log_n = n.trailing_zeros();
-        assert!(
-            n.is_power_of_two() && log_n.is_multiple_of(2),
-            "four_step::forward_square requires N a power of two with log₂(N) even (got N={n})"
-        );
+        assert!(n.is_power_of_two(), "four_step::forward requires N a power of two (got N={n})");
         if n <= 1 {
             return;
         }
-        let m = 1usize << (log_n / 2);
-        debug_assert_eq!(m * m, n);
-
-        // Step A: transpose so that original columns become rows of
-        //         the matrix we'll row-FFT.
-        transpose_square_inplace(a, m);
-
-        // Step B: row-FFTs of length m (the "column FFTs" of original).
-        for chunk in a.chunks_exact_mut(m) {
-            ntt_forward(chunk);
-        }
-
-        // Step C: cross-twiddle.  After B the matrix is m × m with
-        //         B[i, s] sitting at memory position s·m + i (rows
-        //         indexed by `s`, columns by `i`).  Multiply by
-        //         ω_N^(s · i).
-        apply_cross_twiddle(a, n, m, m, /*inverse=*/ false);
-
-        // Step D: transpose back so each new "row" corresponds to a
-        //         single i across all s — these are the length-m
-        //         lines we want to row-FFT next.
-        transpose_square_inplace(a, m);
-
-        // Step E: row-FFTs of length m (the second set of sub-FFTs).
-        for chunk in a.chunks_exact_mut(m) {
-            ntt_forward(chunk);
-        }
-
-        // Output is in "digit-reversed" layout — see module doc.
+        let (n1, n2) = pick_factorization(n);
+        forward_generic(a, n1, n2);
     }
 
-    /// Square-N inverse four-step.  Reverses every step of
-    /// `forward_square` in opposite order, using `ntt_inverse` for the
-    /// sub-transforms (which folds in the 1/m scale per pass; the two
-    /// passes together yield the required 1/N).
-    pub(super) fn inverse_square(a: &mut [u64]) {
+    /// Inverse four-step NTT, paired with [`forward`].  Final 1/N
+    /// scale arrives via the two `ntt_inverse` sub-passes (each does
+    /// 1/m, composing to 1/(N1·N2) = 1/N).
+    pub(super) fn inverse(a: &mut [u64]) {
         let n = a.len();
-        let log_n = n.trailing_zeros();
-        assert!(
-            n.is_power_of_two() && log_n.is_multiple_of(2),
-            "four_step::inverse_square requires N a power of two with log₂(N) even (got N={n})"
-        );
+        assert!(n.is_power_of_two(), "four_step::inverse requires N a power of two (got N={n})");
         if n <= 1 {
             return;
         }
-        let m = 1usize << (log_n / 2);
-        debug_assert_eq!(m * m, n);
+        let (n1, n2) = pick_factorization(n);
+        inverse_generic(a, n1, n2);
+    }
+
+    /// Pick N1 × N2 = N with `N1 ≤ N2` and both powers of two.
+    fn pick_factorization(n: usize) -> (usize, usize) {
+        let log_n = n.trailing_zeros() as usize;
+        let log_n1 = log_n / 2;
+        let log_n2 = log_n - log_n1;
+        let n1 = 1usize << log_n1;
+        let n2 = 1usize << log_n2;
+        debug_assert_eq!(n1 * n2, n);
+        (n1, n2)
+    }
+
+    /// Forward six-step for a given `(n1, n2)` factorisation.
+    ///
+    /// Algorithm:
+    ///   A) transpose `n1 × n2` → `n2 × n1`
+    ///   B) row-FFT each of n2 rows of length n1
+    ///   C) cross-twiddle ω_N^(s·i) at position (s, i)
+    ///   D) transpose `n2 × n1` → `n1 × n2`
+    ///   E) row-FFT each of n1 rows of length n2
+    fn forward_generic(a: &mut [u64], n1: usize, n2: usize) {
+        let n = n1 * n2;
+        debug_assert_eq!(a.len(), n);
+
+        transpose(a, n1, n2);
+        // Matrix is now n2 × n1.
+        for chunk in a.chunks_exact_mut(n1) {
+            ntt_forward(chunk);
+        }
+        apply_cross_twiddle(a, n, n1, n2, /*inverse=*/ false);
+        transpose(a, n2, n1);
+        // Matrix is now n1 × n2.
+        for chunk in a.chunks_exact_mut(n2) {
+            ntt_forward(chunk);
+        }
+    }
+
+    /// Inverse six-step — exact reverse of [`forward_generic`] with
+    /// inverse sub-FFTs and inverse cross-twiddles.
+    fn inverse_generic(a: &mut [u64], n1: usize, n2: usize) {
+        let n = n1 * n2;
+        debug_assert_eq!(a.len(), n);
 
         // Undo step E.
-        for chunk in a.chunks_exact_mut(m) {
+        for chunk in a.chunks_exact_mut(n2) {
             ntt_inverse(chunk);
         }
         // Undo step D.
-        transpose_square_inplace(a, m);
-        // Undo step C (inverse twiddle factors).
-        apply_cross_twiddle(a, n, m, m, /*inverse=*/ true);
+        transpose(a, n1, n2);
+        // Undo step C.
+        apply_cross_twiddle(a, n, n1, n2, /*inverse=*/ true);
         // Undo step B.
-        for chunk in a.chunks_exact_mut(m) {
+        for chunk in a.chunks_exact_mut(n1) {
             ntt_inverse(chunk);
         }
         // Undo step A.
-        transpose_square_inplace(a, m);
+        transpose(a, n2, n1);
     }
 
-    /// In-place transpose of an `m × m` matrix stored row-major.
-    /// Swaps `a[i·m + j]` with `a[j·m + i]` for `i < j`.
+    /// Transpose an `n_rows × n_cols` row-major matrix to
+    /// `n_cols × n_rows` row-major in place.  Picks in-place blockwise
+    /// swap for the square case and an out-of-place copy via a pooled
+    /// scratch buffer for the rectangular case (in-place rectangular
+    /// transpose requires cycle-following, which is fiddly enough to
+    /// be its own change — see task #19).
+    fn transpose(a: &mut [u64], n_rows: usize, n_cols: usize) {
+        if n_rows == n_cols {
+            transpose_square_inplace(a, n_rows);
+        } else {
+            transpose_out_of_place(a, n_rows, n_cols);
+        }
+    }
+
     fn transpose_square_inplace(a: &mut [u64], m: usize) {
         debug_assert_eq!(a.len(), m * m);
         for i in 0..m {
@@ -975,11 +996,23 @@ mod four_step {
         }
     }
 
-    /// Apply the cross-twiddle multiply between the two sub-FFT passes.
-    /// At matrix position (s, i) — `s` ∈ [0, n2), `i` ∈ [0, n1) —
-    /// multiplies the value by ω_N^(s · i) (or its inverse).
-    ///
-    /// Layout: row-major in an `n2 × n1` matrix; memory index = s·n1 + i.
+    fn transpose_out_of_place(a: &mut [u64], n_rows: usize, n_cols: usize) {
+        let n = n_rows * n_cols;
+        debug_assert_eq!(a.len(), n);
+        let mut scratch = ScratchBuf::acquire(n);
+        for r in 0..n_rows {
+            let src_row_base = r * n_cols;
+            for c in 0..n_cols {
+                scratch[c * n_rows + r] = a[src_row_base + c];
+            }
+        }
+        a.copy_from_slice(&scratch);
+    }
+
+    /// Cross-twiddle multiply between sub-FFT passes.  Layout: matrix
+    /// is `n2 × n1` row-major (rows indexed by `s ∈ [0, n2)`, columns
+    /// by `i ∈ [0, n1)`).  Multiplies position `(s, i)` by
+    /// `ω_N^(s·i)` (or its inverse).
     fn apply_cross_twiddle(
         a: &mut [u64],
         n: usize,
@@ -993,8 +1026,7 @@ mod four_step {
         let omega_base = primitive_root_of_unity(n as u64);
         let omega = if inverse { inv(omega_base) } else { omega_base };
 
-        // step[s] = omega^s.  Each row-`s` twiddle chain multiplies by
-        // step[s] per column step.
+        // step[s] = ω^s.  Row s's chain steps by step[s] per column.
         let mut step = Vec::with_capacity(n2);
         let mut w = 1_u64;
         for _ in 0..n2 {
@@ -1011,11 +1043,9 @@ mod four_step {
                 tw = mul(tw, row_step);
             }
         }
-        // Suppress unused-import warning for `add` if it stays unused
-        // in this initial implementation.
-        let _ = add as fn(u64, u64) -> u64;
     }
 }
+
 
 
 
@@ -1711,8 +1741,8 @@ mod tests {
     fn four_step_square_round_trip_n4() {
         let orig = vec![17_u64, 42, 99, 5];
         let mut a = orig.clone();
-        super::four_step::forward_square(&mut a);
-        super::four_step::inverse_square(&mut a);
+        super::four_step::forward(&mut a);
+        super::four_step::inverse(&mut a);
         assert_eq!(a, orig);
     }
 
@@ -1722,8 +1752,8 @@ mod tests {
     fn four_step_square_round_trip_n16() {
         let orig = random_vec(16, 0xCAFE_F00D);
         let mut a = orig.clone();
-        super::four_step::forward_square(&mut a);
-        super::four_step::inverse_square(&mut a);
+        super::four_step::forward(&mut a);
+        super::four_step::inverse(&mut a);
         assert_eq!(a, orig);
     }
 
@@ -1733,8 +1763,8 @@ mod tests {
     fn four_step_square_round_trip_n256() {
         let orig = random_vec(256, 0xDEAD_BEEF);
         let mut a = orig.clone();
-        super::four_step::forward_square(&mut a);
-        super::four_step::inverse_square(&mut a);
+        super::four_step::forward(&mut a);
+        super::four_step::inverse(&mut a);
         assert_eq!(a, orig);
     }
 
@@ -1743,8 +1773,8 @@ mod tests {
     fn four_step_square_round_trip_n1024() {
         let orig = random_vec(1024, 0xABCD_1234);
         let mut a = orig.clone();
-        super::four_step::forward_square(&mut a);
-        super::four_step::inverse_square(&mut a);
+        super::four_step::forward(&mut a);
+        super::four_step::inverse(&mut a);
         assert_eq!(a, orig);
     }
 
@@ -1764,12 +1794,12 @@ mod tests {
         let mut want = vec![0_u64; n];
         want[0] = 4; want[1] = 13; want[2] = 28; want[3] = 27; want[4] = 18;
 
-        super::four_step::forward_square(&mut a);
-        super::four_step::forward_square(&mut b);
+        super::four_step::forward(&mut a);
+        super::four_step::forward(&mut b);
         for i in 0..n {
             a[i] = mul(a[i], b[i]);
         }
-        super::four_step::inverse_square(&mut a);
+        super::four_step::inverse(&mut a);
         assert_eq!(a, want);
     }
 
@@ -1795,12 +1825,12 @@ mod tests {
         let mut want = vec![0_u64; n];
         want[..nc.len()].copy_from_slice(&nc);
 
-        super::four_step::forward_square(&mut a);
-        super::four_step::forward_square(&mut b);
+        super::four_step::forward(&mut a);
+        super::four_step::forward(&mut b);
         for i in 0..n {
             a[i] = mul(a[i], b[i]);
         }
-        super::four_step::inverse_square(&mut a);
+        super::four_step::inverse(&mut a);
         assert_eq!(a, want);
     }
 
@@ -1822,12 +1852,135 @@ mod tests {
         let mut want = vec![0_u64; n];
         want[..nc.len()].copy_from_slice(&nc);
 
-        super::four_step::forward_square(&mut a);
-        super::four_step::forward_square(&mut b);
+        super::four_step::forward(&mut a);
+        super::four_step::forward(&mut b);
         for i in 0..n {
             a[i] = mul(a[i], b[i]);
         }
-        super::four_step::inverse_square(&mut a);
+        super::four_step::inverse(&mut a);
+        assert_eq!(a, want);
+    }
+
+    // ── Four-step: non-square N (odd log₂(N)) ───────────────────────────
+    // These N values exercise the rectangular transpose path (N1 < N2),
+    // which uses an out-of-place copy via the scratch buffer pool.
+
+    /// Round-trip at N=8 (log₂=3, N1=2, N2=4 — smallest non-square).
+    #[test]
+    fn four_step_nonsquare_round_trip_n8() {
+        let orig = random_vec(8, 0xAA01);
+        let mut a = orig.clone();
+        super::four_step::forward(&mut a);
+        super::four_step::inverse(&mut a);
+        assert_eq!(a, orig);
+    }
+
+    /// Round-trip at N=32 (log₂=5, N1=4, N2=8).
+    #[test]
+    fn four_step_nonsquare_round_trip_n32() {
+        let orig = random_vec(32, 0xBB02);
+        let mut a = orig.clone();
+        super::four_step::forward(&mut a);
+        super::four_step::inverse(&mut a);
+        assert_eq!(a, orig);
+    }
+
+    /// Round-trip at N=128 (log₂=7, N1=8, N2=16).
+    #[test]
+    fn four_step_nonsquare_round_trip_n128() {
+        let orig = random_vec(128, 0xCC03);
+        let mut a = orig.clone();
+        super::four_step::forward(&mut a);
+        super::four_step::inverse(&mut a);
+        assert_eq!(a, orig);
+    }
+
+    /// Round-trip at N=512 (log₂=9, N1=16, N2=32).
+    #[test]
+    fn four_step_nonsquare_round_trip_n512() {
+        let orig = random_vec(512, 0xDD04);
+        let mut a = orig.clone();
+        super::four_step::forward(&mut a);
+        super::four_step::inverse(&mut a);
+        assert_eq!(a, orig);
+    }
+
+    /// Round-trip at N=2048 (log₂=11, N1=32, N2=64).
+    #[test]
+    fn four_step_nonsquare_round_trip_n2048() {
+        let orig = random_vec(2048, 0xEE05);
+        let mut a = orig.clone();
+        super::four_step::forward(&mut a);
+        super::four_step::inverse(&mut a);
+        assert_eq!(a, orig);
+    }
+
+    /// Convolution at N=8 against naive reference.
+    #[test]
+    fn four_step_nonsquare_convolution_n8() {
+        let n = 8;
+        let mut a = vec![0_u64; n];
+        let mut b = vec![0_u64; n];
+        a[0] = 7; a[1] = 11; a[2] = 13;
+        b[0] = 2; b[1] = 3; b[2] = 5;
+        // (7 + 11x + 13x²)(2 + 3x + 5x²) = 14 + 43x + 94x² + 94x³ + 65x⁴
+        let mut want = vec![0_u64; n];
+        want[0] = 14; want[1] = 43; want[2] = 94; want[3] = 94; want[4] = 65;
+
+        super::four_step::forward(&mut a);
+        super::four_step::forward(&mut b);
+        for i in 0..n { a[i] = mul(a[i], b[i]); }
+        super::four_step::inverse(&mut a);
+        assert_eq!(a, want);
+    }
+
+    /// Convolution at N=32 with random inputs.
+    #[test]
+    fn four_step_nonsquare_convolution_n32_random() {
+        let n = 32_usize;
+        let half = n / 2;
+        let pa_short = random_vec(half, 0x1010_2020);
+        let pb_short = random_vec(half, 0x3030_4040);
+
+        let mut a = vec![0_u64; n];
+        a[..half].copy_from_slice(&pa_short);
+        let mut b = vec![0_u64; n];
+        b[..half].copy_from_slice(&pb_short);
+
+        let nc = naive_convolution(&pa_short, &pb_short);
+        let mut want = vec![0_u64; n];
+        want[..nc.len()].copy_from_slice(&nc);
+
+        super::four_step::forward(&mut a);
+        super::four_step::forward(&mut b);
+        for i in 0..n { a[i] = mul(a[i], b[i]); }
+        super::four_step::inverse(&mut a);
+        assert_eq!(a, want);
+    }
+
+    /// Convolution at N=512 (largest non-square test) — exercises
+    /// rectangular transpose at a size where any indexing bug would
+    /// surface in random inputs.
+    #[test]
+    fn four_step_nonsquare_convolution_n512_random() {
+        let n = 512_usize;
+        let half = n / 2;
+        let pa_short = random_vec(half, 0x5050_6060);
+        let pb_short = random_vec(half, 0x7070_8080);
+
+        let mut a = vec![0_u64; n];
+        a[..half].copy_from_slice(&pa_short);
+        let mut b = vec![0_u64; n];
+        b[..half].copy_from_slice(&pb_short);
+
+        let nc = naive_convolution(&pa_short, &pb_short);
+        let mut want = vec![0_u64; n];
+        want[..nc.len()].copy_from_slice(&nc);
+
+        super::four_step::forward(&mut a);
+        super::four_step::forward(&mut b);
+        for i in 0..n { a[i] = mul(a[i], b[i]); }
+        super::four_step::inverse(&mut a);
         assert_eq!(a, want);
     }
 }
