@@ -847,7 +847,177 @@ pub(crate) fn mul_mag_ntt(a: &[u64], b: &[u64]) -> Vec<u64> {
 }
 
 
+
 // `parallel_pointwise_threshold` lives in crate::config.
+
+// =====================================================================
+// Four-step NTT (Bailey / matrix Fourier algorithm)
+// =====================================================================
+//
+// At large N, the late butterfly passes in the standard radix-2 NTT
+// have stride N/2, so every memory access misses cache.  The four-step
+// (six-step with bookend transposes) decomposition reorganises an
+// N-element transform into 2 × √N sub-transforms separated by a single
+// cross-twiddle and one transpose.  Each sub-transform operates on
+// √N contiguous elements that fit in L2 cache.
+//
+// **Layout convention.**  Forward leaves the output in a
+// "digit-reversed" order: X[k] for k = i + j·N1 lives at memory
+// position i·N2 + j (i.e. the matrix-axes are swapped relative to the
+// natural-order output a radix-2 forward would produce).  The inverse
+// expects input in that same order and produces natural-order output,
+// so a `forward → pointwise → inverse` round-trip yields the same
+// convolution result as the radix-2 pipeline.  Direct element-wise
+// comparison with radix-2 is therefore *not* a correctness test;
+// convolution-equivalence is.
+//
+// **Sub-FFTs.**  Each sub-transform is itself an NTT — for now we just
+// call the existing `ntt_forward` / `ntt_inverse` on contiguous slices.
+// That includes those functions' own `bit_reverse` + butterflies; the
+// cost is small at √N and the recursive structure can be optimised in
+// a follow-up.
+//
+// **Square N only, for now.**  When N is a perfect square (log₂(N)
+// even), N1 = N2 = √N and the transpose is in-place and easy.  When
+// log₂(N) is odd we'd need a non-square N1 × N2 transpose — that's
+// task #16; this module panics on a non-square length so callers must
+// dispatch.
+
+mod four_step {
+    use super::{
+        add, inv, mul, ntt_forward, ntt_inverse, primitive_root_of_unity,
+    };
+
+    /// Square-N forward four-step.  `a.len()` must be a power of two
+    /// and `log₂(a.len())` must be even (so N is a perfect square).
+    pub(super) fn forward_square(a: &mut [u64]) {
+        let n = a.len();
+        let log_n = n.trailing_zeros();
+        assert!(
+            n.is_power_of_two() && log_n.is_multiple_of(2),
+            "four_step::forward_square requires N a power of two with log₂(N) even (got N={n})"
+        );
+        if n <= 1 {
+            return;
+        }
+        let m = 1usize << (log_n / 2);
+        debug_assert_eq!(m * m, n);
+
+        // Step A: transpose so that original columns become rows of
+        //         the matrix we'll row-FFT.
+        transpose_square_inplace(a, m);
+
+        // Step B: row-FFTs of length m (the "column FFTs" of original).
+        for chunk in a.chunks_exact_mut(m) {
+            ntt_forward(chunk);
+        }
+
+        // Step C: cross-twiddle.  After B the matrix is m × m with
+        //         B[i, s] sitting at memory position s·m + i (rows
+        //         indexed by `s`, columns by `i`).  Multiply by
+        //         ω_N^(s · i).
+        apply_cross_twiddle(a, n, m, m, /*inverse=*/ false);
+
+        // Step D: transpose back so each new "row" corresponds to a
+        //         single i across all s — these are the length-m
+        //         lines we want to row-FFT next.
+        transpose_square_inplace(a, m);
+
+        // Step E: row-FFTs of length m (the second set of sub-FFTs).
+        for chunk in a.chunks_exact_mut(m) {
+            ntt_forward(chunk);
+        }
+
+        // Output is in "digit-reversed" layout — see module doc.
+    }
+
+    /// Square-N inverse four-step.  Reverses every step of
+    /// `forward_square` in opposite order, using `ntt_inverse` for the
+    /// sub-transforms (which folds in the 1/m scale per pass; the two
+    /// passes together yield the required 1/N).
+    pub(super) fn inverse_square(a: &mut [u64]) {
+        let n = a.len();
+        let log_n = n.trailing_zeros();
+        assert!(
+            n.is_power_of_two() && log_n.is_multiple_of(2),
+            "four_step::inverse_square requires N a power of two with log₂(N) even (got N={n})"
+        );
+        if n <= 1 {
+            return;
+        }
+        let m = 1usize << (log_n / 2);
+        debug_assert_eq!(m * m, n);
+
+        // Undo step E.
+        for chunk in a.chunks_exact_mut(m) {
+            ntt_inverse(chunk);
+        }
+        // Undo step D.
+        transpose_square_inplace(a, m);
+        // Undo step C (inverse twiddle factors).
+        apply_cross_twiddle(a, n, m, m, /*inverse=*/ true);
+        // Undo step B.
+        for chunk in a.chunks_exact_mut(m) {
+            ntt_inverse(chunk);
+        }
+        // Undo step A.
+        transpose_square_inplace(a, m);
+    }
+
+    /// In-place transpose of an `m × m` matrix stored row-major.
+    /// Swaps `a[i·m + j]` with `a[j·m + i]` for `i < j`.
+    fn transpose_square_inplace(a: &mut [u64], m: usize) {
+        debug_assert_eq!(a.len(), m * m);
+        for i in 0..m {
+            for j in (i + 1)..m {
+                a.swap(i * m + j, j * m + i);
+            }
+        }
+    }
+
+    /// Apply the cross-twiddle multiply between the two sub-FFT passes.
+    /// At matrix position (s, i) — `s` ∈ [0, n2), `i` ∈ [0, n1) —
+    /// multiplies the value by ω_N^(s · i) (or its inverse).
+    ///
+    /// Layout: row-major in an `n2 × n1` matrix; memory index = s·n1 + i.
+    fn apply_cross_twiddle(
+        a: &mut [u64],
+        n: usize,
+        n1: usize,
+        n2: usize,
+        inverse: bool,
+    ) {
+        debug_assert_eq!(a.len(), n);
+        debug_assert_eq!(n1 * n2, n);
+
+        let omega_base = primitive_root_of_unity(n as u64);
+        let omega = if inverse { inv(omega_base) } else { omega_base };
+
+        // step[s] = omega^s.  Each row-`s` twiddle chain multiplies by
+        // step[s] per column step.
+        let mut step = Vec::with_capacity(n2);
+        let mut w = 1_u64;
+        for _ in 0..n2 {
+            step.push(w);
+            w = mul(w, omega);
+        }
+
+        for s in 0..n2 {
+            let row_start = s * n1;
+            let row_step = step[s];
+            let mut tw = 1_u64;
+            for i in 0..n1 {
+                a[row_start + i] = mul(a[row_start + i], tw);
+                tw = mul(tw, row_step);
+            }
+        }
+        // Suppress unused-import warning for `add` if it stays unused
+        // in this initial implementation.
+        let _ = add as fn(u64, u64) -> u64;
+    }
+}
+
+
 
 // =====================================================================
 // Tests for field arithmetic + NTT + pack/unpack + top-level multiply
@@ -1521,4 +1691,143 @@ mod tests {
     // inputs (including realistic high-coeff values and uneven tail
     // chunks); the integration with mul_mag_ntt is exercised by every
     // smaller NTT correctness test, just on the serial path.
+
+    // ── Four-step / six-step (Bailey matrix Fourier) ────────────────────
+    //
+    // For correctness we don't compare four-step output to radix-2
+    // output element-wise — the two have different output orderings
+    // (four-step lives in "digit-reversed" layout; see the module
+    // doc).  Instead we test by black-box equivalence:
+    //   * round-trip: forward + inverse = identity (and matches the
+    //     1/N scale baked into the inverse).
+    //   * convolution: forward + pointwise + inverse = naive
+    //     convolution mod P.  This is the actual property mul_mag_ntt
+    //     relies on.
+    // Sub-FFTs use the existing radix-2 NTT, so any radix-2 bug would
+    // already be flagged by the earlier tests.
+
+    /// Forward + inverse must return exactly the input.
+    #[test]
+    fn four_step_square_round_trip_n4() {
+        let orig = vec![17_u64, 42, 99, 5];
+        let mut a = orig.clone();
+        super::four_step::forward_square(&mut a);
+        super::four_step::inverse_square(&mut a);
+        assert_eq!(a, orig);
+    }
+
+    /// Round-trip at N=16 with random-ish values that stress carry
+    /// and mod-reduction in the field ops.
+    #[test]
+    fn four_step_square_round_trip_n16() {
+        let orig = random_vec(16, 0xCAFE_F00D);
+        let mut a = orig.clone();
+        super::four_step::forward_square(&mut a);
+        super::four_step::inverse_square(&mut a);
+        assert_eq!(a, orig);
+    }
+
+    /// Round-trip at N=256 (larger square — exercises the inner
+    /// transpose loop and longer cross-twiddle chains).
+    #[test]
+    fn four_step_square_round_trip_n256() {
+        let orig = random_vec(256, 0xDEAD_BEEF);
+        let mut a = orig.clone();
+        super::four_step::forward_square(&mut a);
+        super::four_step::inverse_square(&mut a);
+        assert_eq!(a, orig);
+    }
+
+    /// Round-trip at N=1024 with a generic field-element pattern.
+    #[test]
+    fn four_step_square_round_trip_n1024() {
+        let orig = random_vec(1024, 0xABCD_1234);
+        let mut a = orig.clone();
+        super::four_step::forward_square(&mut a);
+        super::four_step::inverse_square(&mut a);
+        assert_eq!(a, orig);
+    }
+
+    /// Cyclic convolution via four-step must match the naive
+    /// reference at N=16.  Zero-padded operands make this equivalent
+    /// to linear convolution of the original short sequences.
+    #[test]
+    fn four_step_square_convolution_n16() {
+        let n = 16;
+        // 3-element operands zero-padded to length N; the cyclic
+        // convolution equals the linear convolution.
+        let mut a = vec![0_u64; n];
+        let mut b = vec![0_u64; n];
+        a[0] = 1; a[1] = 2; a[2] = 3;
+        b[0] = 4; b[1] = 5; b[2] = 6;
+        // Linear convolution: (1+2x+3x²)(4+5x+6x²) = 4+13x+28x²+27x³+18x⁴
+        let mut want = vec![0_u64; n];
+        want[0] = 4; want[1] = 13; want[2] = 28; want[3] = 27; want[4] = 18;
+
+        super::four_step::forward_square(&mut a);
+        super::four_step::forward_square(&mut b);
+        for i in 0..n {
+            a[i] = mul(a[i], b[i]);
+        }
+        super::four_step::inverse_square(&mut a);
+        assert_eq!(a, want);
+    }
+
+    /// Convolution at N=64 with deterministic-random inputs;
+    /// compared against `naive_convolution` (mod P sums).  This is
+    /// the high-confidence correctness gate.
+    #[test]
+    fn four_step_square_convolution_n64_random() {
+        let n = 64_usize;
+        // Use input lengths n/2 so the linear convolution fits.
+        let half = n / 2;
+        let pa_short = random_vec(half, 0x1111_2222);
+        let pb_short = random_vec(half, 0x3333_4444);
+
+        // Zero-pad to length N for the cyclic-becomes-linear trick.
+        let mut a = vec![0_u64; n];
+        a[..half].copy_from_slice(&pa_short);
+        let mut b = vec![0_u64; n];
+        b[..half].copy_from_slice(&pb_short);
+
+        // Reference: naive linear convolution, zero-extended to N.
+        let nc = naive_convolution(&pa_short, &pb_short);
+        let mut want = vec![0_u64; n];
+        want[..nc.len()].copy_from_slice(&nc);
+
+        super::four_step::forward_square(&mut a);
+        super::four_step::forward_square(&mut b);
+        for i in 0..n {
+            a[i] = mul(a[i], b[i]);
+        }
+        super::four_step::inverse_square(&mut a);
+        assert_eq!(a, want);
+    }
+
+    /// Convolution at N=256 — a larger square that exercises both
+    /// sub-FFT passes and the full cross-twiddle table.
+    #[test]
+    fn four_step_square_convolution_n256_random() {
+        let n = 256_usize;
+        let half = n / 2;
+        let pa_short = random_vec(half, 0xAAAA_BBBB);
+        let pb_short = random_vec(half, 0xCCCC_DDDD);
+
+        let mut a = vec![0_u64; n];
+        a[..half].copy_from_slice(&pa_short);
+        let mut b = vec![0_u64; n];
+        b[..half].copy_from_slice(&pb_short);
+
+        let nc = naive_convolution(&pa_short, &pb_short);
+        let mut want = vec![0_u64; n];
+        want[..nc.len()].copy_from_slice(&nc);
+
+        super::four_step::forward_square(&mut a);
+        super::four_step::forward_square(&mut b);
+        for i in 0..n {
+            a[i] = mul(a[i], b[i]);
+        }
+        super::four_step::inverse_square(&mut a);
+        assert_eq!(a, want);
+    }
 }
