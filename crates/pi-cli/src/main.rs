@@ -192,6 +192,7 @@ struct NttSection {
     target_task_size: Option<usize>,
     parallel_pack_threshold: Option<usize>,
     parallel_pointwise_threshold: Option<usize>,
+    four_step_threshold: Option<usize>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -271,6 +272,9 @@ fn load_and_apply_config(path: Option<&Path>, digits: u64) -> Result<()> {
     }
     if let Some(v) = file_cfg.bignum.ntt.parallel_pointwise_threshold {
         bn.ntt.parallel_pointwise_threshold = v;
+    }
+    if let Some(v) = file_cfg.bignum.ntt.four_step_threshold {
+        bn.ntt.four_step_threshold = v;
     }
     if let Some(v) = file_cfg.decimal_conversion.to_string_dc_threshold {
         bn.to_string_dc_threshold = v;
@@ -369,13 +373,12 @@ fn run_compute(cli: Cli) -> Result<()> {
 
     // Print the plan before opening anything so a typo in --digits or -o
     // can be spotted (and ^C'd) before the slow work starts.
-    eprintln!("computing pi:");
-    eprintln!("  digits:    {}", fmt_thousands(cli.digits));
-    eprintln!("  algorithm: {}", algorithm.name());
-    eprintln!(
-        "  output:    {}",
-        if writing_to_stdout { "stdout" } else { &cli.output }
-    );
+    let dest = if writing_to_stdout {
+        "stdout"
+    } else {
+        &cli.output
+    };
+    print_startup_banner(cli.digits, algorithm.name(), dest);
 
     let mut sink: Box<dyn DigitSink> = if writing_to_stdout {
         Box::new(stdout_sink())
@@ -557,6 +560,198 @@ pub(crate) fn fmt_thousands(n: u64) -> String {
         out.push(b as char);
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Startup banner.
+//
+// Prints the run plan plus every performance knob the generator (or the
+// user's --config) ended up applying.  Read on stderr; survives stdout
+// redirection.  Bold labels via ANSI when stderr is a TTY, plain when
+// it's piped to a file.
+// ---------------------------------------------------------------------------
+
+fn print_startup_banner(digits: u64, algorithm: &str, dest: &str) {
+    use std::io::IsTerminal;
+    let use_color = std::io::stderr().is_terminal();
+    let bn = bignum::config::Config::current();
+    let pc = pi_core::config::Config::current();
+    let scratch = bignum::storage::current_scratch_dir();
+
+    // Section header (no bold; the header itself reads as a label).
+    eprintln!("computing pi:");
+    banner_row(use_color, "digits", &fmt_thousands(digits));
+    banner_row(use_color, "algorithm", algorithm);
+    banner_row(use_color, "output", dest);
+
+    eprintln!();
+    eprintln!("binary splitting:");
+    banner_row(
+        use_color,
+        "parallel split threshold",
+        &fmt_thousands(pc.chudnovsky.parallel_split_threshold),
+    );
+    banner_row(
+        use_color,
+        "sequential top threshold",
+        &if pc.chudnovsky.sequential_top_threshold == 0 {
+            "off".to_string()
+        } else {
+            format!(
+                "{} terms",
+                fmt_thousands(pc.chudnovsky.sequential_top_threshold)
+            )
+        },
+    );
+    banner_row(
+        use_color,
+        "parallel final assembly",
+        if pc.chudnovsky.parallel_final_assembly {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
+
+    eprintln!();
+    eprintln!("multiplication:");
+    banner_row(
+        use_color,
+        "schoolbook → karatsuba @",
+        &format!("{} limbs", fmt_thousands(bn.karatsuba_threshold as u64)),
+    );
+    banner_row(
+        use_color,
+        "karatsuba → NTT @",
+        &format!("{} limbs", fmt_thousands(bn.ntt_threshold as u64)),
+    );
+    banner_row(
+        use_color,
+        "parallel karatsuba @",
+        &format!(
+            "{} limbs",
+            fmt_thousands(bn.parallel_karatsuba_threshold as u64)
+        ),
+    );
+    banner_row(
+        use_color,
+        "NTT target task size",
+        &format!("{} u64", fmt_thousands(bn.ntt.target_task_size as u64)),
+    );
+    banner_row(
+        use_color,
+        "NTT parallel pack @",
+        &fmt_thousands(bn.ntt.parallel_pack_threshold as u64),
+    );
+    banner_row(
+        use_color,
+        "NTT parallel pointwise @",
+        &fmt_thousands(bn.ntt.parallel_pointwise_threshold as u64),
+    );
+    banner_row(
+        use_color,
+        "four-step NTT @",
+        &if bn.ntt.four_step_threshold == usize::MAX {
+            "disabled".to_string()
+        } else {
+            format!("N ≥ {}", fmt_thousands(bn.ntt.four_step_threshold as u64))
+        },
+    );
+
+    eprintln!();
+    eprintln!("division:");
+    banner_row(
+        use_color,
+        "Knuth → Newton @",
+        &format!("{} limbs", fmt_thousands(bn.newton_div_threshold as u64)),
+    );
+
+    eprintln!();
+    eprintln!("decimal conversion:");
+    banner_row(
+        use_color,
+        "D&C threshold",
+        &format!("{} limbs", fmt_thousands(bn.to_string_dc_threshold as u64)),
+    );
+    banner_row(
+        use_color,
+        "parallel D&C @",
+        &format!(
+            "{} limbs",
+            fmt_thousands(bn.parallel_to_string_threshold as u64)
+        ),
+    );
+
+    eprintln!();
+    eprintln!("storage:");
+    if bn.disk_limb_threshold == usize::MAX {
+        banner_row(use_color, "limb storage", "RAM only (disk-backing disabled)");
+        banner_row(
+            use_color,
+            "scratch dir",
+            &format!("{} (unused)", scratch.display()),
+        );
+    } else {
+        let bytes = bn.disk_limb_threshold.saturating_mul(8);
+        let human = human_bytes(bytes);
+        banner_row(
+            use_color,
+            "limb storage",
+            &format!(
+                "DISK-BACKED above {} limbs (~{})",
+                fmt_thousands(bn.disk_limb_threshold as u64),
+                human,
+            ),
+        );
+        banner_row(use_color, "scratch dir", &scratch.display().to_string());
+    }
+
+    eprintln!();
+    eprintln!("runtime:");
+    banner_row(
+        use_color,
+        "rayon threads",
+        &rayon::current_num_threads().to_string(),
+    );
+    banner_row(
+        use_color,
+        "perf sample interval",
+        &format!("{} ms", pc.perf.default_sample_ms),
+    );
+    eprintln!();
+}
+
+/// Emit one `  label:  value` row, padding the label to a fixed
+/// width and bolding it on a TTY.  The label-width budget is set so
+/// the longest current label fits without truncation.
+fn banner_row(use_color: bool, label: &str, value: &str) {
+    const LABEL_WIDTH: usize = 28;
+    let with_colon = format!("{}:", label);
+    if use_color {
+        // Pad first, then wrap in bold so trailing spaces are inside
+        // the SGR span (invisible) but the visible label is bold.
+        eprintln!("  \x1b[1m{:<width$}\x1b[0m  {}", with_colon, value, width = LABEL_WIDTH);
+    } else {
+        eprintln!("  {:<width$}  {}", with_colon, value, width = LABEL_WIDTH);
+    }
+}
+
+/// Render a byte count using the largest base-1024 unit that yields
+/// a value ≥ 1 (e.g. 5_000_000 -> "4.77 MiB").  Used for the storage
+/// section of the startup banner.
+fn human_bytes(n: usize) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i + 1 < UNITS.len() {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{} {}", n, UNITS[i])
+    } else {
+        format!("{:.2} {}", v, UNITS[i])
+    }
 }
 
 fn describe_byte(b: u8) -> String {

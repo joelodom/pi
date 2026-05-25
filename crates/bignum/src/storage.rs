@@ -364,6 +364,13 @@ fn scratch_dir() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
+/// Public view of the currently-configured scratch directory.  Returns
+/// the override set via [`set_scratch_dir`] if one is active, otherwise
+/// `std::env::temp_dir()`.  Used by the CLI to surface the value in
+/// the startup banner.
+pub fn current_scratch_dir() -> PathBuf {
+    scratch_dir()
+}
 // ---- Public counter accessors (for perf logging) --------------------
 
 #[inline]
