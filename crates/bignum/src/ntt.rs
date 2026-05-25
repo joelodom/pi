@@ -677,6 +677,13 @@ fn unpack(coeffs: &[u64]) -> Vec<u64> {
     if coeffs.is_empty() {
         return Vec::new();
     }
+    if coeffs.len() < PARALLEL_UNPACK_THRESHOLD {
+        return unpack_serial(coeffs);
+    }
+    unpack_parallel(coeffs)
+}
+
+fn unpack_serial(coeffs: &[u64]) -> Vec<u64> {
     let total_bits = (coeffs.len() - 1) * BITS_PER_COEFF + 64;
     let approx_limbs = total_bits / 64 + 2;
     let mut result: Vec<u64> = Vec::with_capacity(approx_limbs);
@@ -708,6 +715,80 @@ fn unpack(coeffs: &[u64]) -> Vec<u64> {
     }
     result
 }
+
+/// Process one chunk: fold its coeffs into limbs assuming `carry_in=0`,
+/// return `(limbs, residual_carry)`.  The residual is the u128 left in
+/// the running accumulator after the chunk's last block was emitted;
+/// inter-chunk merge folds it into the next chunk's first limb.
+fn unpack_process_chunk(chunk: &[u64]) -> (Vec<u64>, u128) {
+    let mut limbs = Vec::with_capacity(chunk.len().div_ceil(COEFFS_PER_LIMB));
+    let mut carry: u128 = 0;
+    let mut i = 0;
+    while i < chunk.len() {
+        for offset_idx in 0..COEFFS_PER_LIMB {
+            if i >= chunk.len() {
+                break;
+            }
+            let bit_offset = offset_idx * BITS_PER_COEFF;
+            carry += (chunk[i] as u128) << bit_offset;
+            i += 1;
+        }
+        limbs.push(carry as u64);
+        carry >>= 64;
+    }
+    (limbs, carry)
+}
+
+fn unpack_parallel(coeffs: &[u64]) -> Vec<u64> {
+    // Partition coeffs into chunks at COEFFS_PER_LIMB block boundaries
+    // (except the last chunk, which may include a short tail).  Each
+    // chunk runs the same inner loop the serial version uses, starting
+    // from carry=0; the merge phase then folds inter-chunk carries.
+    let total_blocks = coeffs.len() / COEFFS_PER_LIMB;
+    let max_chunks = rayon::current_num_threads().max(1);
+    let num_chunks = total_blocks.min(max_chunks).max(1);
+    let blocks_per_chunk = total_blocks.div_ceil(num_chunks);
+    let coeffs_per_chunk = blocks_per_chunk * COEFFS_PER_LIMB;
+
+    let chunk_outs: Vec<(Vec<u64>, u128)> = coeffs
+        .par_chunks(coeffs_per_chunk)
+        .map(unpack_process_chunk)
+        .collect();
+
+    // Serial merge: propagate inter-chunk carries.  Each chunk's local
+    // limbs were computed assuming carry_in=0 — the previous chunk's
+    // residual carry needs to be added to this chunk's first limb,
+    // cascading any further overflow into subsequent limbs.  In
+    // practice the residual is ≤ 2^46 (bounded by the per-block carry
+    // analysis), so the cascade depth past the first limb is tiny.
+    let approx_limbs = coeffs.len().div_ceil(COEFFS_PER_LIMB) + 2;
+    let mut result = Vec::with_capacity(approx_limbs);
+    let mut spare: u128 = 0;
+    for (limbs, final_carry) in chunk_outs {
+        for limb in limbs {
+            let sum = (limb as u128) + spare;
+            result.push(sum as u64);
+            spare = sum >> 64;
+        }
+        // The chunk's residual carry is at the same bit-position as the
+        // next chunk's first limb (i.e. it is *added*, not concatenated).
+        spare += final_carry;
+    }
+    while spare != 0 {
+        result.push(spare as u64);
+        spare >>= 64;
+    }
+    while result.last() == Some(&0) {
+        result.pop();
+    }
+    result
+}
+
+/// Below this many coefficients, unpack runs serially — the merge
+/// overhead plus rayon dispatch isn't worth the parallelism.  Above
+/// this (~1 M coeffs ≈ 250 K output limbs) each rayon worker has
+/// substantial work and the parallel speedup dominates.
+const PARALLEL_UNPACK_THRESHOLD: usize = 1 << 20;
 
 // =====================================================================
 // Top-level multiplication
@@ -1384,4 +1465,60 @@ mod tests {
         let got = mul_mag_ntt(&a, &b);
         assert_eq!(got, want);
     }
+
+    // ── Parallel unpack ─────────────────────────────────────────────────
+
+    /// Parallel and serial unpack must produce byte-identical output on
+    /// the same input, even when the carry cascades across chunks.
+    #[test]
+    fn unpack_parallel_matches_serial() {
+        // Build a coeff stream above the parallel threshold with
+        // deterministic large-ish values to exercise carry propagation.
+        let n = PARALLEL_UNPACK_THRESHOLD + 4_321; // include a tail
+        let coeffs: Vec<u64> = (0..n as u64)
+            .map(|i| {
+                // Mix in non-trivial bits without exceeding the
+                // worst-case-per-coeff bound used by mul_mag_ntt.
+                ((i.wrapping_mul(0x1234_5678_9abc_def0)) >> 8) & ((1u64 << 32) - 1)
+            })
+            .collect();
+
+        let serial = unpack_serial(&coeffs);
+        let parallel = unpack_parallel(&coeffs);
+        assert_eq!(serial, parallel, "parallel unpack diverges from serial");
+    }
+
+    /// Stress: many chunks, varied coeff sizes, including coeffs that
+    /// stress the cross-chunk carry merge (very high values in the
+    /// final block of each chunk).
+    #[test]
+    fn unpack_parallel_cross_chunk_carry() {
+        // Use a count well above threshold and seed with high values
+        // so the residual at chunk boundaries is non-trivial.
+        let n = PARALLEL_UNPACK_THRESHOLD * 4;
+        let coeffs: Vec<u64> = (0..n as u64)
+            .map(|i| {
+                // Worst-case-ish: large coeffs near u32::MAX.
+                if i % 7 == 0 {
+                    (1u64 << 32) - 1
+                } else {
+                    i.wrapping_mul(0xDEAD_BEEF) & ((1u64 << 32) - 1)
+                }
+            })
+            .collect();
+
+        let serial = unpack_serial(&coeffs);
+        let parallel = unpack_parallel(&coeffs);
+        assert_eq!(serial, parallel);
+    }
+
+    // NOTE: An end-to-end NTT round-trip test at a size that triggers
+    // parallel unpack (n_out ≥ PARALLEL_UNPACK_THRESHOLD) would need
+    // operands of ~130K limbs each.  Schoolbook on inputs that large
+    // takes minutes in a debug build, blowing the test suite's wall
+    // budget.  The two direct comparison tests above prove
+    // unpack_parallel(coeffs) ≡ unpack_serial(coeffs) on representative
+    // inputs (including realistic high-coeff values and uneven tail
+    // chunks); the integration with mul_mag_ntt is exercised by every
+    // smaller NTT correctness test, just on the serial path.
 }
