@@ -74,8 +74,19 @@ pub struct NttConfig {
     /// decomposition.  Below this we use the straight radix-2 NTT.
     /// Four-step trades extra arithmetic (transpose + cross-twiddle)
     /// for L2-resident sub-FFTs; it wins once `N` is large enough
-    /// that radix-2's late butterfly passes stride beyond cache.
-    /// Set to `usize::MAX` to disable four-step entirely.
+    /// that radix-2's late butterfly passes stride beyond cache and
+    /// every access misses.  Set to `2^32` (effectively the max
+    /// possible N) to disable four-step entirely.
+    ///
+    /// **Empirical note:** measured on a 2-core Graviton 2 host at
+    /// N = 2^21 (10M-digit pi top-of-tree mults), four-step is
+    /// ~28 % *slower* than radix-2 — the constant overhead of
+    /// 2·√N sub-FFTs plus the rectangular-N transpose outweighs the
+    /// modest cache savings when only the last few radix-2 passes
+    /// were actually cache-bound.  The default is therefore set
+    /// conservatively at 2^25; production hosts with high core
+    /// counts and runs at N ≥ 2^27 will see real benefit and may
+    /// want to lower it via `--config`.
     pub four_step_threshold: usize,
 }
 
@@ -103,11 +114,14 @@ impl Default for NttConfig {
             target_task_size: 1 << 16, // 64 K u64s = 512 KB per task
             parallel_pack_threshold: 1024,
             parallel_pointwise_threshold: 1024,
-            // 2^20 = ~1 M elements (8 MiB).  Above this, the late
-            // radix-2 butterfly passes have strides well beyond L2
-            // on typical hardware (Graviton 2/3 = 1 MiB L2/core);
-            // four-step's sub-FFTs become cache-resident and win.
-            four_step_threshold: 1 << 20,
+            // 2^25 = ~33 M elements (256 MiB working set).  See the
+            // empirical note on the field doc — at smaller N our
+            // four-step impl loses to radix-2 because the per-call
+            // overhead (transposes + 2·√N sub-FFTs) outweighs the
+            // late-pass cache savings.  Production hosts can lower
+            // this via `--config` once they have benchmark evidence
+            // it pays off at their N and core count.
+            four_step_threshold: 1 << 25,
         }
     }
 }
@@ -125,7 +139,7 @@ static PARALLEL_TO_STRING_THRESHOLD: AtomicUsize = AtomicUsize::new(256);
 static NTT_TARGET_TASK_SIZE: AtomicUsize = AtomicUsize::new(1 << 16);
 static NTT_PARALLEL_PACK_THRESHOLD: AtomicUsize = AtomicUsize::new(1024);
 static NTT_PARALLEL_POINTWISE_THRESHOLD: AtomicUsize = AtomicUsize::new(1024);
-static NTT_FOUR_STEP_THRESHOLD: AtomicUsize = AtomicUsize::new(1 << 20);
+static NTT_FOUR_STEP_THRESHOLD: AtomicUsize = AtomicUsize::new(1 << 25);
 static DISK_LIMB_THRESHOLD: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// Push a [`Config`] into the live atomics.  Call this once at

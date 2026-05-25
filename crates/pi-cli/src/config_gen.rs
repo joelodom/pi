@@ -67,18 +67,21 @@ pub fn generate(digits: u64, hw: &HardwareProfile) -> String {
         _ => 16_384,
     };
 
-    // Four-step (Bailey matrix Fourier) NTT crossover.  We engage
-    // four-step once the radix-2 late butterfly passes start striding
-    // beyond L2.  Graviton 2/3/4 have ≈1 MiB L2 per core; for an N-
-    // length transform the last pass strides N/2 elements (8N bytes),
-    // so it busts L2 around N ≈ 2^17.  The transition-zone overhead
-    // of four-step (transposes + cross-twiddle) wants a bit of slack,
-    // so we use 8× that breakeven on small core counts and tighter on
-    // many-core hosts where the cache effects bite harder.
+    // Four-step (Bailey matrix Fourier) NTT crossover.  Measured at
+    // N = 2^21 on a 2-core Graviton 2 host, our four-step impl is
+    // ~28 % *slower* than radix-2 — the constant overhead of 2·√N
+    // sub-FFTs plus the rectangular-N transpose outweighs the modest
+    // cache savings when only a handful of radix-2 passes were really
+    // cache-bound.  We therefore default to a high crossover (four-step
+    // engages only at N ≥ 2^25, ≈256 MiB) on small hosts.  Many-core
+    // hosts see worse late-pass cache behaviour and can afford a lower
+    // threshold; task #19 (parallel transpose + parallel cross-twiddle)
+    // will let us push these values down further.
     let four_step_threshold: usize = match cores {
-        0..=12 => 1 << 20, // 1 M elements ≈ 8 MiB
-        13..=64 => 1 << 19, // 512 K
-        _ => 1 << 18,       // 256 K — many-core hosts hit cache pressure earlier
+        0..=12 => 1 << 26,  // ≈ 512 MiB working set — effectively off
+                            //   on this size of host until task #19 lands
+        13..=64 => 1 << 25, // ≈ 256 MiB
+        _ => 1 << 24,       // ≈ 128 MiB — many-core hosts hit cache pressure earlier
     };
 
     // chudnovsky.parallel_split_threshold: lower on many-core boxes.
