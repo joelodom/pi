@@ -906,6 +906,8 @@ mod four_step {
     use super::{
         inv, mul, ntt_forward, ntt_inverse, primitive_root_of_unity, ScratchBuf,
     };
+    use rayon::prelude::*;
+
 
     /// Forward four-step NTT for any power-of-two `N`.  When N is a
     /// perfect square (log₂(N) even) the transpose is in-place;
@@ -958,18 +960,23 @@ mod four_step {
         debug_assert_eq!(a.len(), n);
 
         transpose(a, n1, n2);
-        // Matrix is now n2 × n1.
-        for chunk in a.chunks_exact_mut(n1) {
+        // Matrix is now n2 × n1.  Sub-FFTs are independent across
+        // rows; run them on the rayon thread pool.  Each sub-FFT is
+        // itself internally parallel, but its rows are small (√N) so
+        // the win is mostly from running many sub-FFTs concurrently.
+        a.par_chunks_exact_mut(n1).for_each(|chunk| {
             ntt_forward(chunk);
-        }
+        });
         apply_cross_twiddle(a, n, n1, n2, /*inverse=*/ false);
         transpose(a, n2, n1);
         // Matrix is now n1 × n2.
-        for chunk in a.chunks_exact_mut(n2) {
+        a.par_chunks_exact_mut(n2).for_each(|chunk| {
             ntt_forward(chunk);
-        }
+        });
     }
 
+    /// Inverse six-step — exact reverse of [`forward_generic`] with
+    /// inverse sub-FFTs and inverse cross-twiddles.
     /// Inverse six-step — exact reverse of [`forward_generic`] with
     /// inverse sub-FFTs and inverse cross-twiddles.
     fn inverse_generic(a: &mut [u64], n1: usize, n2: usize) {
@@ -977,27 +984,36 @@ mod four_step {
         debug_assert_eq!(a.len(), n);
 
         // Undo step E.
-        for chunk in a.chunks_exact_mut(n2) {
+        a.par_chunks_exact_mut(n2).for_each(|chunk| {
             ntt_inverse(chunk);
-        }
+        });
         // Undo step D.
         transpose(a, n1, n2);
         // Undo step C.
         apply_cross_twiddle(a, n, n1, n2, /*inverse=*/ true);
         // Undo step B.
-        for chunk in a.chunks_exact_mut(n1) {
+        a.par_chunks_exact_mut(n1).for_each(|chunk| {
             ntt_inverse(chunk);
-        }
+        });
         // Undo step A.
         transpose(a, n2, n1);
     }
 
+    /// `*mut u64` wrapper that's `Send + Sync`.  Used by the
+    /// transpose helpers below to satisfy the borrow checker on
+    /// access patterns where disjointness is guaranteed by the math
+    /// (each closure invocation touches its own pair / row of cells)
+    /// but not by Rust's type system.
+    #[derive(Copy, Clone)]
+    struct SyncPtr(*mut u64);
+    unsafe impl Send for SyncPtr {}
+    unsafe impl Sync for SyncPtr {}
+
     /// Transpose an `n_rows × n_cols` row-major matrix to
     /// `n_cols × n_rows` row-major in place.  Picks in-place blockwise
     /// swap for the square case and an out-of-place copy via a pooled
-    /// scratch buffer for the rectangular case (in-place rectangular
-    /// transpose requires cycle-following, which is fiddly enough to
-    /// be its own change — see task #19).
+    /// scratch buffer for the rectangular case.  Both variants are
+    /// parallelised.
     fn transpose(a: &mut [u64], n_rows: usize, n_cols: usize) {
         if n_rows == n_cols {
             transpose_square_inplace(a, n_rows);
@@ -1008,30 +1024,54 @@ mod four_step {
 
     fn transpose_square_inplace(a: &mut [u64], m: usize) {
         debug_assert_eq!(a.len(), m * m);
-        for i in 0..m {
+        let ptr = SyncPtr(a.as_mut_ptr());
+        (0..m).into_par_iter().for_each(|i| {
+            // SAFETY: for `i < j`, the swap at (i, j) ↔ (j, i) is the
+            // unique iteration that touches those two cells.  Cells
+            // on the diagonal are never touched.  Each iteration
+            // owns its own row above the diagonal, so threads write
+            // to disjoint memory.
+            let ptr = ptr;
             for j in (i + 1)..m {
-                a.swap(i * m + j, j * m + i);
+                unsafe {
+                    std::ptr::swap(ptr.0.add(i * m + j), ptr.0.add(j * m + i));
+                }
             }
-        }
+        });
     }
 
     fn transpose_out_of_place(a: &mut [u64], n_rows: usize, n_cols: usize) {
         let n = n_rows * n_cols;
         debug_assert_eq!(a.len(), n);
         let mut scratch = ScratchBuf::acquire(n);
-        for r in 0..n_rows {
-            let src_row_base = r * n_cols;
-            for c in 0..n_cols {
-                scratch[c * n_rows + r] = a[src_row_base + c];
-            }
-        }
+
+        // Scatter: each source row r writes to column r of the
+        // destination.  Different source rows write to disjoint
+        // destination cells (column = r, different r), so the writes
+        // are race-free.  Rust can't see this; use a raw pointer.
+        let dst_ptr = SyncPtr(scratch.as_mut_ptr());
+        a.par_chunks_exact(n_cols)
+            .enumerate()
+            .for_each(|(r, src_row)| {
+                let dst_ptr = dst_ptr;
+                for c in 0..n_cols {
+                    // SAFETY: column `r` of `scratch` is owned by
+                    // this iteration alone; the write target index
+                    // `c * n_rows + r` is in-bounds (c < n_cols,
+                    // r < n_rows) and disjoint from other iterations.
+                    unsafe {
+                        *dst_ptr.0.add(c * n_rows + r) = src_row[c];
+                    }
+                }
+            });
         a.copy_from_slice(&scratch);
     }
 
     /// Cross-twiddle multiply between sub-FFT passes.  Layout: matrix
     /// is `n2 × n1` row-major (rows indexed by `s ∈ [0, n2)`, columns
     /// by `i ∈ [0, n1)`).  Multiplies position `(s, i)` by
-    /// `ω_N^(s·i)` (or its inverse).
+    /// `ω_N^(s·i)` (or its inverse).  Rows are independent — we
+    /// parallelize over `s`.
     fn apply_cross_twiddle(
         a: &mut [u64],
         n: usize,
@@ -1053,20 +1093,16 @@ mod four_step {
             w = mul(w, omega);
         }
 
-        for s in 0..n2 {
-            let row_start = s * n1;
+        a.par_chunks_exact_mut(n1).enumerate().for_each(|(s, row)| {
             let row_step = step[s];
             let mut tw = 1_u64;
-            for i in 0..n1 {
-                a[row_start + i] = mul(a[row_start + i], tw);
+            for slot in row.iter_mut() {
+                *slot = mul(*slot, tw);
                 tw = mul(tw, row_step);
             }
-        }
+        });
     }
 }
-
-
-
 
 // =====================================================================
 // Tests for field arithmetic + NTT + pack/unpack + top-level multiply
