@@ -15,6 +15,7 @@ eb20dc8 bignum: scratch buffer pool for mul_mag_ntt to cut peak-RSS spikes
 2ebf4ea bignum: parallelize build_twiddles for large counts
 57f09ea bignum: cache NTT twiddle tables across mul_mag_ntt calls
 4cfa63e bignum: parallel bit_reverse with raw-pointer swaps
+424486b bignum: parallel unpack for large NTT outputs
 ```
 
 ### What each does (and why it matters at 1B+ digits)
@@ -53,9 +54,19 @@ eb20dc8 bignum: scratch buffer pool for mul_mag_ntt to cut peak-RSS spikes
   so iterations are race-free; parallelized via a raw-pointer
   wrapper.  Engages above N = 2^18.
 
+* **Parallel unpack (424486b)** — the last serial step in the NTT
+  pipeline.  At N=2^31 the carry-chain loop processes ~2 B
+  coefficients serially (~5–10 s wall time per call).  Partition
+  into chunks at COEFFS_PER_LIMB block boundaries, each chunk runs
+  the recurrence assuming `carry_in=0`, and a serial merge pass
+  propagates inter-chunk carries.  Engages above 2^20 coeffs
+  (≈ 250 K output limbs).  Together with the other parallelizations
+  above, the entire `mul_mag_ntt` pipeline (pack, forward, pointwise,
+  inverse, unpack) is now parallelized end-to-end.
+
 ### Tests added this session
 
-11 new tests, all in `crates/bignum/src/`:
+15 new tests, all in `crates/bignum/src/`:
 
 * `integer::tests::karatsuba_above_ntt_routes_correctly_on_oversize`
 * `ntt::tests::pool_reuses_released_buffer_at_same_size`
@@ -70,9 +81,10 @@ eb20dc8 bignum: scratch buffer pool for mul_mag_ntt to cut peak-RSS spikes
 * `ntt::tests::bit_reverse_parallel_matches_serial`
 * `ntt::tests::bit_reverse_parallel_is_involution`
 * `ntt::tests::bit_reverse_parallel_via_ntt_round_trip`
+* `ntt::tests::unpack_parallel_matches_serial`
+* `ntt::tests::unpack_parallel_cross_chunk_carry`
 
-Full bignum suite: 79 passing (was 65 before this session).
-
+Full bignum suite: 81 passing (was 65 before this session).
 ### Smoke tests run on the downsized 2-vCPU box
 
 | Digits | Wall    | Peak RSS | vs reference                   |
