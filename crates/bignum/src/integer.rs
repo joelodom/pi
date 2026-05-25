@@ -430,20 +430,55 @@ fn sub_signed(a: &Integer, b: &Integer) -> Integer {
 // Multiplication
 // =====================================================================
 
-/// Below this many limbs in the smaller operand, schoolbook beats
-/// Karatsuba (the constant-factor overhead of 3 recursive calls plus
-/// the extra adds and subtracts outweighs the saved multiplication).
-/// Dispatch: NTT for very large operands, Karatsuba for medium,
-/// schoolbook for small.  Thresholds live in [`crate::config`] and
-/// are tunable at runtime (see `config/*.toml`).
+/// Dispatch: NTT for very large operands (when they fit in a single
+/// pass), Karatsuba for medium, schoolbook for small.  Thresholds live
+/// in [`crate::config`] and are tunable at runtime.
+///
+/// When operands are so large that the required NTT transform length
+/// would exceed `2^32` (the Goldilocks prime limit), the call is routed
+/// through `mul_mag_karatsuba` regardless of the NTT threshold.
+/// Karatsuba halves the operands each level; after ⌈log₂(size/limit)⌉
+/// levels the leaf pieces fit in a single NTT pass.  At 100B pi digits
+/// (Q ≈ 2.6B limbs) this adds three levels (27 NTT leaves at ~2^31
+/// each) — about 3× more arithmetic than an ideal arbitrary-length NTT,
+/// but correct and requiring no changes to the field or butterfly code.
 fn mul_mag(a: &[u64], b: &[u64]) -> Vec<u64> {
+    mul_mag_dispatch(
+        a,
+        b,
+        1usize << 32,
+        crate::config::ntt_threshold(),
+        crate::config::karatsuba_threshold(),
+    )
+}
+
+/// Routing core for `mul_mag`, with the NTT size cap and the NTT /
+/// Karatsuba thresholds passed in.  Extracted so tests can force the
+/// Karatsuba-above-NTT branch on small inputs by lowering
+/// `ntt_max_coeffs` below the actual NTT cap; production callers use
+/// `mul_mag` which plumbs in the real `1usize << 32` Goldilocks limit.
+fn mul_mag_dispatch(
+    a: &[u64],
+    b: &[u64],
+    ntt_max_coeffs: usize,
+    ntt_threshold: usize,
+    karatsuba_threshold: usize,
+) -> Vec<u64> {
     if a.is_empty() || b.is_empty() {
         return Vec::new();
     }
     let smaller = a.len().min(b.len());
-    if smaller >= crate::config::ntt_threshold() {
+    // Guard: single-prime Goldilocks NTT requires transform length
+    // N ≤ 2^32.  N = next_power_of_two((len(a) + len(b)) *
+    // COEFFS_PER_LIMB).  Conservatively check the coefficient sum;
+    // if it exceeds the cap the NTT cannot handle the multiplication
+    // and we route through Karatsuba instead.
+    let ntt_fits = (a.len().saturating_add(b.len()))
+        .saturating_mul(crate::ntt::COEFFS_PER_LIMB)
+        <= ntt_max_coeffs;
+    if ntt_fits && smaller >= ntt_threshold {
         crate::ntt::mul_mag_ntt(a, b)
-    } else if smaller < crate::config::karatsuba_threshold() {
+    } else if smaller < karatsuba_threshold {
         mul_mag_schoolbook(a, b)
     } else {
         mul_mag_karatsuba(a, b)
@@ -1686,5 +1721,35 @@ mod tests {
         let b = make_int(101, 32_000);
         let a = make_int(103, 64_000);
         assert_divmod_matches_knuth(&a, &b);
+    }
+
+    #[test]
+    fn karatsuba_above_ntt_routes_correctly_on_oversize() {
+        // Force the ntt_fits=false branch on small inputs by passing
+        // a tiny `ntt_max_coeffs`.  With ntt_threshold=50 and inputs
+        // of 200 limbs each, the unguarded routing would take NTT;
+        // the guard diverts to Karatsuba, whose result must match a
+        // schoolbook reference.  This is the exact code path that
+        // production hits at >20B pi digits, exercised cheaply.
+        let a: Vec<u64> = (0..200_u64)
+            .map(|i| 0xDEAD_BEEF_CAFE_0001_u64.wrapping_mul(i.wrapping_add(1)))
+            .collect();
+        let b: Vec<u64> = (0..200_u64)
+            .map(|i| 0xFACE_F00D_1234_5678_u64.wrapping_mul(i.wrapping_add(7)))
+            .collect();
+        let want = mul_mag_schoolbook(&a, &b);
+
+        // ntt_max_coeffs=100 → (200+200)*4 = 1600 > 100 → ntt_fits=false.
+        // smaller(200) >= karatsuba_threshold(32) → Karatsuba branch.
+        let got_kara = mul_mag_dispatch(&a, &b, 100, 50, 32);
+        assert_eq!(
+            got_kara, want,
+            "Karatsuba-above-NTT routing produced wrong product"
+        );
+
+        // Sanity: same inputs with a large `ntt_max_coeffs` take the
+        // NTT path and must produce the same answer.
+        let got_ntt = mul_mag_dispatch(&a, &b, 1usize << 32, 50, 32);
+        assert_eq!(got_ntt, want, "NTT path produced wrong product");
     }
 }
