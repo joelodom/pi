@@ -102,6 +102,29 @@ impl PiAlgorithm for Chudnovsky {
         // its own large buffers.  At 10B digits this single change
         // saves ~16 GB of peak memory.
         let pi = {
+            // The pi_numer chain in FA is `√10005 · 426880 · q`.  Only
+            // the final `· q` depends on BS output; the `√10005 · 426880`
+            // factor depends solely on the precision and can be computed
+            // any time after we know `prec`.  At billion-plus digits the
+            // sqrt (precision-doubling Newton iteration) is a multi-
+            // minute chain of full-width multiplications; running it
+            // during BS folds it into wall time we're already paying for.
+            // The thread shares the rayon worker pool for its internal
+            // NTT muls, co-scheduling naturally with BS — and the sqrt
+            // chain is short relative to BS at scale, so it finishes
+            // during BS's earlier (highly parallel) levels before BS
+            // reaches its serialised top-of-tree combines.
+            let prec = plan.precision_bits;
+            let sqrt_handle = std::thread::Builder::new()
+                .name("chudnovsky-sqrt".into())
+                .spawn(move || {
+                    let mut p = Float::with_val_64(prec, 10_005);
+                    p.sqrt_mut();
+                    p *= 426_880_u32;
+                    p
+                })
+                .expect("spawning sqrt worker thread");
+
             progress.start_phase(PHASE_BINARY_SPLITTING, n_terms);
             let (q, t) = binary_split(1, n_terms + 1, progress);
             progress.end_phase();
@@ -126,13 +149,21 @@ impl PiAlgorithm for Chudnovsky {
             drop(t);
             progress.tick();
 
-            let prec = plan.precision_bits;
             // `denom_int` is consumed by `.into()` so its memory
             // is released when `denom_float` is built.
             let denom_float: Float = denom_int.into();
 
-            // Two chains compute pi_numer (sqrt · 426880 · q) and
-            // recip (1 / denom).  Running them concurrently fills each
+            // Wait for the background sqrt thread (started before BS).
+            // At scale this returns immediately; the sqrt finished
+            // during the parallel lower-tree levels of BS.
+            let sqrt_426880 = sqrt_handle
+                .join()
+                .expect("chudnovsky-sqrt thread panicked");
+
+            // Two chains compute pi_numer (sqrt · 426880 · q, where the
+            // sqrt · 426880 factor is precomputed in the background
+            // thread above — only `· q` remains here) and recip
+            // (1 / denom).  Running them concurrently fills each
             // other's NTT serial pockets (~10% faster); running them
             // sequentially holds only one chain's Float intermediates
             // live at a time (saves multi-GB peak at billion-digit
@@ -141,18 +172,14 @@ impl PiAlgorithm for Chudnovsky {
                 rayon::join(
                     || denom_float.reciprocal_at_prec(prec + 16),
                     || {
-                        let mut p = Float::with_val_64(prec, 10_005);
-                        p.sqrt_mut();
-                        p *= 426_880_u32;
+                        let mut p = sqrt_426880;
                         p *= &q;
                         p
                     },
                 )
             } else {
                 let recip = denom_float.reciprocal_at_prec(prec + 16);
-                let mut p = Float::with_val_64(prec, 10_005);
-                p.sqrt_mut();
-                p *= 426_880_u32;
+                let mut p = sqrt_426880;
                 p *= &q;
                 (recip, p)
             };

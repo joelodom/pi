@@ -28,10 +28,15 @@ pub fn generate(digits: u64, hw: &HardwareProfile) -> String {
     //
     // Empirically: a D-digit pi run peaks at roughly
     //   peak_rss ≈ 5.4 GB × (D / 100M)        (fully parallel)
-    // on this codebase (measured at 100M).  We use that linear
-    // extrapolation as a first-cut, then bias on whether the host
-    // has more or fewer cores than the baseline.
-    let est_peak_full_gb = 5.4 * (digits as f64) / 1.0e8 * (cores as f64 / 11.0).max(0.5);
+    // measured at 100M on both 11-core (5.0 GB) and 64-core (5.0 GB)
+    // hosts.  Peak is dominated by the top-of-tree integers (Q, T,
+    // denom, recip, pi_numer) and 1-2 concurrent NTT scratch buffers
+    // in FA — neither scales with core count.  An earlier version
+    // multiplied by `cores/11` and overestimated by ~10× on
+    // many-core hosts (predicted 314 GB at 1B on 64 cores, actual
+    // peak 31 GB), forcing disk-backing to engage on instances with
+    // ample RAM.  Linear-in-digits, flat-in-cores matches the data.
+    let est_peak_full_gb = 5.4 * (digits as f64) / 1.0e8;
 
     let memory_mode = if hw.ram_bytes == 0 {
         // Unknown RAM — be conservative.
@@ -128,7 +133,8 @@ pub fn generate(digits: u64, hw: &HardwareProfile) -> String {
     ).unwrap();
     writeln!(s, "# Target: {} digits", fmt_thousands(digits)).unwrap();
     writeln!(s, "# Estimated peak RSS at full parallelism: {:.1} GB", est_peak_full_gb).unwrap();
-    writeln!(s, "#   (linear extrapolation from a measured 5.4 GB at 100M, scaled by core count)").unwrap();
+    writeln!(s, "#   (linear extrapolation from a measured 5.4 GB at 100M; peak is set by").unwrap();
+    writeln!(s, "#    top-of-tree integers + NTT scratch, which do not scale with core count)").unwrap();
     writeln!(s, "# Memory mode: {:?}", memory_mode).unwrap();
     write_memory_mode_rationale(&mut s, memory_mode, est_peak_full_gb, ram_gb);
     writeln!(s, "# =============================================================================").unwrap();
