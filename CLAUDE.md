@@ -2,6 +2,11 @@
 
 Short, focused — extending this costs tokens on every turn.
 
+If `HANDOFF-10B.md` exists at repo root, read it first — it has
+session-specific context (current experiment, recent commits, known
+bottlenecks) that supersedes the defaults below.  Delete it once its
+experiment is concluded.
+
 ## Performance-knob maintenance contract
 
 Knobs live in two places: per-crate `Config` structs (in
