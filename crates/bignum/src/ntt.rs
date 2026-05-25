@@ -355,12 +355,13 @@ fn butterflies(a: &mut [u64], inverse: bool) {
     let mut len = 2usize;
     while len <= n {
         let half = len / 2;
-        let omega_len_base = primitive_root_of_unity(len as u64);
-        let omega_len = if inverse { inv(omega_len_base) } else { omega_len_base };
 
-        // Twiddle table.  Serial chain of `half - 1` muls — cheap
-        // relative to the `n / 2` muls in the actual pass.
-        let twiddles = build_twiddles(omega_len, half);
+        // Twiddles for this pass come from a process-wide cache keyed
+        // by (count, inverse).  Built on first call at this size,
+        // reused on subsequent ones; binary splitting hits the cache
+        // frequently.  See the twiddle_cache module above.
+        let twiddles_arc = twiddle_cache::get(half, inverse);
+        let twiddles: &[u64] = twiddles_arc.as_slice();
 
         let groups = n / len;
 
@@ -372,7 +373,6 @@ fn butterflies(a: &mut [u64], inverse: bool) {
             // slices we can iterate in parallel chunks.
             for group in a.chunks_mut(len) {
                 let (lo, hi) = group.split_at_mut(half);
-                let tw = &twiddles;
                 lo.par_chunks_mut(target_task)
                     .zip(hi.par_chunks_mut(target_task))
                     .enumerate()
@@ -380,7 +380,7 @@ fn butterflies(a: &mut [u64], inverse: bool) {
                         let base = chunk_idx * target_task;
                         for j in 0..lo_chunk.len() {
                             let u = lo_chunk[j];
-                            let t = mul(tw[base + j], hi_chunk[j]);
+                            let t = mul(twiddles[base + j], hi_chunk[j]);
                             lo_chunk[j] = add(u, t);
                             hi_chunk[j] = sub(u, t);
                         }
@@ -398,12 +398,12 @@ fn butterflies(a: &mut [u64], inverse: bool) {
             if n > task_size {
                 a.par_chunks_mut(task_size).for_each(|big_chunk| {
                     for group in big_chunk.chunks_mut(len) {
-                        butterfly_group(group, &twiddles, half);
+                        butterfly_group(group, twiddles, half);
                     }
                 });
             } else {
                 for group in a.chunks_mut(len) {
-                    butterfly_group(group, &twiddles, half);
+                    butterfly_group(group, twiddles, half);
                 }
             }
         }
@@ -490,6 +490,81 @@ fn build_twiddles_parallel(omega: u64, count: usize) -> Vec<u64> {
 /// 5 ns/mul, 8192 muls is ~40 µs of serial work — about where parallel
 /// dispatch becomes worthwhile even on a 2-core host.
 const PARALLEL_TWIDDLE_THRESHOLD: usize = 8192;
+
+// =====================================================================
+// Twiddle cache
+// =====================================================================
+//
+// Each NTT pass needs an `omega_len`-power twiddle table.  These tables
+// depend only on `(count, inverse)` — i.e. they are the same for every
+// call at a given `N`.  Binary splitting performs many multiplications
+// at similar sizes, so the second and later NTT calls at any given N
+// can reuse the table built by the first.
+//
+// Tables are stored as `Arc<Vec<u64>>` so the cache hands out cheap
+// reference-counted handles instead of cloning the data.  We cap the
+// per-table count at 2^28 (== 2 GiB per cached table); above that the
+// table is built every time.  At 100B pi digits the very largest
+// passes (half ≥ 2^28) fall outside the cache, but the dozens of
+// smaller passes — which together do most of the total twiddle work —
+// are amortized to one build per (size, direction).
+
+const MAX_CACHED_TWIDDLE_COUNT: usize = 1 << 28;
+
+mod twiddle_cache {
+    use super::{build_twiddles, inv, primitive_root_of_unity, MAX_CACHED_TWIDDLE_COUNT};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    type Table = Arc<Vec<u64>>;
+    type Cache = Mutex<HashMap<(usize, bool), Table>>;
+
+    fn cache() -> &'static Cache {
+        static CACHE: OnceLock<Cache> = OnceLock::new();
+        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Get the twiddle table of length `count` for an NTT pass of
+    /// length `count * 2`.  `inverse=true` returns the inverse-NTT
+    /// twiddles (powers of `inv(omega)`).  Builds on first request,
+    /// hits the cache for subsequent requests at the same key.
+    pub(crate) fn get(count: usize, inverse: bool) -> Table {
+        let key = (count, inverse);
+        if let Some(t) = cache().lock().expect("twiddle cache poisoned").get(&key).cloned() {
+            return t;
+        }
+        // Build outside the lock so concurrent first-time misses at
+        // different keys don't serialize on the global mutex.
+        let len = (count * 2).max(2);
+        let omega_base = primitive_root_of_unity(len as u64);
+        let omega = if inverse { inv(omega_base) } else { omega_base };
+        let built: Table = Arc::new(build_twiddles(omega, count));
+        if count <= MAX_CACHED_TWIDDLE_COUNT {
+            // `or_insert_with` keeps the first installed table if
+            // another thread raced us; the loser's table is dropped
+            // when the Arc goes out of scope.
+            let mut guard = cache().lock().expect("twiddle cache poisoned");
+            return Arc::clone(
+                guard
+                    .entry(key)
+                    .or_insert_with(|| Arc::clone(&built)),
+            );
+        }
+        built
+    }
+
+    /// Test-only: how many distinct keys are cached right now.
+    #[cfg(test)]
+    pub(crate) fn entry_count() -> usize {
+        cache().lock().unwrap().len()
+    }
+
+    /// Test-only: clear the cache.  Used to make tests independent.
+    #[cfg(test)]
+    pub(crate) fn clear() {
+        cache().lock().unwrap().clear();
+    }
+}
 
 // =====================================================================
 // Bit-packing: limbs ↔ NTT coefficients
@@ -1140,4 +1215,64 @@ mod tests {
         let parallel = build_twiddles_parallel(omega, count);
         assert_eq!(serial, parallel);
     }
+
+    // ── Twiddle cache ───────────────────────────────────────────────────
+
+    /// Cache hit returns the same `Arc` and table contents match the
+    /// direct build.
+    #[test]
+    fn twiddle_cache_hit_returns_correct_table() {
+        // Use a size unlikely to collide with concurrent tests.
+        let half = 257_usize.next_power_of_two();
+        twiddle_cache::clear();
+
+        // First call: miss → builds.
+        let first = twiddle_cache::get(half, false);
+
+        // Second call: hit → returns same data.
+        let second = twiddle_cache::get(half, false);
+        assert_eq!(*first, *second);
+        // Both Arcs point at the same underlying allocation.
+        assert!(Arc::ptr_eq(&first, &second));
+
+        // The cached table matches a direct build.
+        let omega = primitive_root_of_unity((half * 2) as u64);
+        let reference = build_twiddles(omega, half);
+        assert_eq!(*first, reference);
+    }
+
+    /// Forward and inverse keys are stored independently.
+    #[test]
+    fn twiddle_cache_forward_and_inverse_are_distinct() {
+        let half = 4096_usize;
+        twiddle_cache::clear();
+        let fwd = twiddle_cache::get(half, false);
+        let inv_table = twiddle_cache::get(half, true);
+        assert_ne!(*fwd, *inv_table, "forward and inverse must differ");
+
+        // Validate inverse table matches direct build.
+        let omega_base = primitive_root_of_unity((half * 2) as u64);
+        let omega_inv = inv(omega_base);
+        let reference = build_twiddles(omega_inv, half);
+        assert_eq!(*inv_table, reference);
+    }
+
+    /// Caching must not change NTT correctness — running the same
+    /// multiplication twice (first call miss, second call hit) must
+    /// produce the same answer as schoolbook.
+    #[test]
+    fn twiddle_cache_preserves_ntt_correctness() {
+        let a = random_vec(400, 0x1111_2222_3333_4444);
+        let b = random_vec(400, 0x5555_6666_7777_8888);
+        let want = schoolbook(&a, &b);
+
+        // Both calls go through the cache (first builds, second hits).
+        let first = mul_mag_ntt(&a, &b);
+        assert_eq!(first, want);
+        let second = mul_mag_ntt(&a, &b);
+        assert_eq!(second, want);
+    }
+
+    /// Need `Arc::ptr_eq` for the hit test.
+    use std::sync::Arc;
 }
