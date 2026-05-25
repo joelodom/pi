@@ -1,5 +1,134 @@
 # 10B-digit run handoff
 
+## Update 2026-05-25 (overnight session)
+
+The 10B run from 2026-05-24 panicked partway through binary splitting
+with `assert!(n <= (1usize << 32))` in `mul_mag_ntt`.  The next 10B
+attempt and any 100B attempt need a rebuilt binary that includes the
+overnight fixes below.
+
+### Commits added this session
+
+```
+841c1d0 bignum: route oversized NTT multiplications through Karatsuba splitting
+eb20dc8 bignum: scratch buffer pool for mul_mag_ntt to cut peak-RSS spikes
+2ebf4ea bignum: parallelize build_twiddles for large counts
+57f09ea bignum: cache NTT twiddle tables across mul_mag_ntt calls
+4cfa63e bignum: parallel bit_reverse with raw-pointer swaps
+```
+
+### What each does (and why it matters at 1B+ digits)
+
+* **NTT routing fix (841c1d0)** — operands too large for a single
+  Goldilocks-prime NTT (N > 2^32 coeffs) used to hit a hard `assert!`.
+  Now they're routed through `mul_mag_karatsuba`, which halves the
+  operands recursively until each leaf fits.  At 100B digits this
+  costs three Karatsuba levels (27 NTT leaves at N ~ 2^31).
+  *Without this, 100B can't even start.*
+
+* **Scratch buffer pool (eb20dc8)** — `mul_mag_ntt` no longer
+  allocates fresh `Vec<u64>` workspace on every call.  An RAII handle
+  pulls from a per-size pool (cap 4 ordinary, 1 huge ≥ 1 GiB).  At
+  100B with 16 GB scratch per leaf NTT × 27 leaves, this is the
+  difference between paging the allocator constantly and reusing
+  pages.  Direct effect: lower peak-RSS variance → cheaper instance.
+
+* **Parallel build_twiddles (2ebf4ea)** — twiddle recurrence is
+  serial as written.  At N=2^31 the largest pass's twiddle build was
+  a 5+ s serial chain (worst-case 10+ s) per NTT call.  Split into
+  chunks with precomputed per-chunk starting omegas, runs across
+  rayon workers.
+
+* **Twiddle cache (57f09ea)** — twiddle tables are pure functions of
+  `(count, inverse)`.  Built once per (size, direction) and reused
+  via `Arc<Vec<u64>>`.  Binary splitting hits the cache constantly
+  because most mults at any tree level share the same N.  Per-table
+  cap of 2^28 entries (≤ 2 GiB) keeps any single cached table
+  bounded.
+
+* **Parallel bit_reverse (4cfa63e)** — bit-reverse is cache-hostile
+  (`a[i]` swap with `a[rev(i)]`, distant in memory).  At N=2^31,
+  ~1 B swaps × ~16 B per swap = ~16 GB of memory traffic that the
+  serial loop runs in maybe 30 s.  Pairs `{i, rev(i)}` are disjoint
+  so iterations are race-free; parallelized via a raw-pointer
+  wrapper.  Engages above N = 2^18.
+
+### Tests added this session
+
+11 new tests, all in `crates/bignum/src/`:
+
+* `integer::tests::karatsuba_above_ntt_routes_correctly_on_oversize`
+* `ntt::tests::pool_reuses_released_buffer_at_same_size`
+* `ntt::tests::pool_caps_at_max_per_size_under_repeated_ntt`
+* `ntt::tests::pool_reuse_preserves_correctness`
+* `ntt::tests::build_twiddles_parallel_matches_serial`
+* `ntt::tests::build_twiddles_at_threshold`
+* `ntt::tests::build_twiddles_uneven_chunks`
+* `ntt::tests::twiddle_cache_hit_returns_correct_table`
+* `ntt::tests::twiddle_cache_forward_and_inverse_are_distinct`
+* `ntt::tests::twiddle_cache_preserves_ntt_correctness`
+* `ntt::tests::bit_reverse_parallel_matches_serial`
+* `ntt::tests::bit_reverse_parallel_is_involution`
+* `ntt::tests::bit_reverse_parallel_via_ntt_round_trip`
+
+Full bignum suite: 79 passing (was 65 before this session).
+
+### Smoke tests run on the downsized 2-vCPU box
+
+| Digits | Wall    | Peak RSS | vs reference                   |
+|--------|---------|----------|--------------------------------|
+| 1M     | 13 s    | ~50 MB   | first 50 digits match canonical π |
+| 2M     | n/a     | ~120 MB  | byte-identical with 5M overlap  |
+| 3M     | 25 s    | ~190 MB  | byte-identical with 5M overlap  |
+| 5M     | 36 s    | 329 MB   | byte-identical with 10M overlap |
+| 10M    | 80 s    | 615 MB   | byte-identical with 5M overlap  |
+| 20M    | 174 s   | 1.2 GB   | byte-identical with 10M overlap |
+
+Memory scaling is roughly linear with digits (matches the generator's
+5.4 GB / 100M model); wall time is roughly linear at this scale on
+2 cores (no NTT cache effects yet because N stays under L3).
+
+### Suggested next steps (not done — too risky for unattended)
+
+1. **Four-step / cache-blocked NTT** (the deferred `√N × √N` matrix
+   decomposition called out in `ntt.rs`'s module doc).  This is the
+   single biggest theoretical win at N > 2^25 because late butterfly
+   passes currently miss cache on essentially every access.  But the
+   implementation is fiddly (transpose, twiddle correction, sub-FFT
+   wiring) and the failure modes are subtle.  Recommend a focused
+   daytime session with the user available.
+
+2. **Radix-4 butterflies** — fewer total mul/add ops per pass, ~10–
+   15 % NTT speedup.  Less risky than four-step but still a real
+   rewrite of the butterfly inner loops.
+
+3. **Parallel `unpack`** — currently serial.  At N=2^31 it's ~5–10 s
+   per call.  Cross-chunk carry merge is the tricky bit; ~3 % NTT
+   speedup, not the biggest fish.
+
+4. **Re-run 10B** with the rebuilt binary on a smaller, cheaper
+   instance.  The pool + cache reductions should let it succeed with
+   the existing memory footprint (~240 GB peak); the wall-time
+   improvements are speculative until measured.  Recommend a
+   `c8g.metal-48xl` or step down to `c7g.16xlarge` with `--digits
+   1_000_000_000` first to recalibrate the predicted-vs-actual peak
+   RSS curve with the new pool behaviour.
+
+### House rules (unchanged)
+
+* **Don't commit without explicit permission** — overnight session
+  was given blanket permission for the NTT improvement work; that
+  authorization ended with this handoff.  Next change needs its own
+  ask.
+* **Run-size ceiling: 20M digits** without explicit instruction in
+  the current turn.
+
+---
+
+## Original handoff (before the failed 10B run)
+
+
+
 Context for picking up the pi-on-EC2 work in a fresh session.  Written
 2026-05-24 before a 10B-digit attempt on a Graviton instance; revise
 or delete once the 10B is complete and analysed.
