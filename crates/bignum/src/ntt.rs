@@ -423,10 +423,18 @@ fn butterfly_group(chunk: &mut [u64], twiddles: &[u64], half: usize) {
 }
 
 fn build_twiddles(omega: u64, count: usize) -> Vec<u64> {
-    let mut out = Vec::with_capacity(count);
     if count == 0 {
-        return out;
+        return Vec::new();
     }
+    if count < PARALLEL_TWIDDLE_THRESHOLD {
+        return build_twiddles_serial(omega, count);
+    }
+    build_twiddles_parallel(omega, count)
+}
+
+#[inline]
+fn build_twiddles_serial(omega: u64, count: usize) -> Vec<u64> {
+    let mut out = Vec::with_capacity(count);
     let mut w = 1_u64;
     out.push(w);
     for _ in 1..count {
@@ -435,6 +443,53 @@ fn build_twiddles(omega: u64, count: usize) -> Vec<u64> {
     }
     out
 }
+
+/// Parallel twiddle builder for large counts.  The straight recurrence
+/// `w[i+1] = mul(w[i], omega)` is serial, but it splits cleanly: each
+/// chunk runs the same recurrence starting from `omega^chunk_start`.
+///
+/// We precompute the per-chunk starting values (a tiny serial chain of
+/// `num_chunks` muls) and then let rayon run the per-chunk recurrences
+/// in parallel.  At N=2^28 this drops a ~1 s serial chain to a few ms
+/// on the high-core hosts used for large pi runs.
+fn build_twiddles_parallel(omega: u64, count: usize) -> Vec<u64> {
+    // Aim for each parallel chunk to do at least MIN_CHUNK muls so the
+    // rayon dispatch overhead is amortized.  Cap chunk count at the
+    // available threads (no benefit to more parallel chunks than CPUs).
+    const MIN_CHUNK: usize = 4096;
+    let max_chunks = rayon::current_num_threads().max(1);
+    let num_chunks = ((count / MIN_CHUNK).max(1)).min(max_chunks);
+    let chunk_size = count.div_ceil(num_chunks);
+
+    // Per-chunk starting omega: chunk k starts at omega^(k * chunk_size).
+    // Serial chain of `num_chunks` muls — trivial compared with the
+    // per-chunk `chunk_size` muls run in parallel.
+    let chunk_omega = pow(omega, chunk_size as u64);
+    let mut chunk_starts = Vec::with_capacity(num_chunks);
+    let mut w = 1_u64;
+    for _ in 0..num_chunks {
+        chunk_starts.push(w);
+        w = mul(w, chunk_omega);
+    }
+
+    let mut out = vec![0u64; count];
+    out.par_chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(idx, chunk)| {
+            let mut w = chunk_starts[idx];
+            for slot in chunk.iter_mut() {
+                *slot = w;
+                w = mul(w, omega);
+            }
+        });
+    out
+}
+
+/// Twiddle counts below this run serially.  Above this, parallel
+/// chunking pays for the rayon dispatch overhead (~10s of µs).  At
+/// 5 ns/mul, 8192 muls is ~40 µs of serial work — about where parallel
+/// dispatch becomes worthwhile even on a 2-core host.
+const PARALLEL_TWIDDLE_THRESHOLD: usize = 8192;
 
 // =====================================================================
 // Bit-packing: limbs ↔ NTT coefficients
@@ -1041,5 +1096,48 @@ mod tests {
         let want_cd = schoolbook(&c, &d);
         let got_cd = mul_mag_ntt(&c, &d);
         assert_eq!(got_cd, want_cd);
+    }
+
+    // ── build_twiddles parallelization ──────────────────────────────────
+
+    /// Parallel and serial twiddle builders must produce byte-identical
+    /// output — they implement the same recurrence, just chunked.
+    #[test]
+    fn build_twiddles_parallel_matches_serial() {
+        // Pick a power-of-two count above the parallel threshold so the
+        // parallel path is exercised.
+        let count = 1 << 16; // 65536
+        assert!(count >= PARALLEL_TWIDDLE_THRESHOLD);
+        // Use a primitive root of unity of order at least `count` so
+        // the twiddle table is the genuine NTT table for a real pass.
+        let omega = primitive_root_of_unity(count as u64);
+
+        let serial = build_twiddles_serial(omega, count);
+        let parallel = build_twiddles_parallel(omega, count);
+        assert_eq!(serial.len(), count);
+        assert_eq!(parallel.len(), count);
+        assert_eq!(serial, parallel, "parallel twiddles diverge from serial");
+    }
+
+    /// Edge case: count just at the parallel threshold.
+    #[test]
+    fn build_twiddles_at_threshold() {
+        let count = PARALLEL_TWIDDLE_THRESHOLD;
+        let omega = primitive_root_of_unity(count.next_power_of_two() as u64);
+        let serial = build_twiddles_serial(omega, count);
+        let parallel = build_twiddles_parallel(omega, count);
+        assert_eq!(serial, parallel);
+    }
+
+    /// Edge case: count not divisible by chunk_size (last chunk shorter).
+    #[test]
+    fn build_twiddles_uneven_chunks() {
+        // PARALLEL_TWIDDLE_THRESHOLD * 3 + 7 → not a multiple of any
+        // reasonable num_chunks, exercising the short-tail chunk.
+        let count = PARALLEL_TWIDDLE_THRESHOLD * 3 + 7;
+        let omega = primitive_root_of_unity(count.next_power_of_two() as u64);
+        let serial = build_twiddles_serial(omega, count);
+        let parallel = build_twiddles_parallel(omega, count);
+        assert_eq!(serial, parallel);
     }
 }
